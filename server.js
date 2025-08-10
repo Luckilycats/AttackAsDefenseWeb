@@ -1,5 +1,6 @@
-// server.js — 单房间 + 玩家/观战分配 + 扫掠网格(DDA)碰撞
-// 一体化部署：静态托管 + 同端口 WebSocket + 地图生成 + 基本对战逻辑
+// server.js — 单房间：静态托管 + 同端口 WebSocket + 地图生成 + 对战逻辑 + 刷新投票
+// 消息：join / start / room / state / ended
+// 新增：refresh_request / refresh_prompt / refresh_status / refresh_vote / refresh_result
 
 const path = require('path');
 const http = require('http');
@@ -14,9 +15,11 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 /* -------------------- 常量与工具 -------------------- */
-const W = 100, H = 100;                    // 地图尺寸
-const TICK_MS = 50;                        // 服务器帧率 20fps
-const START_GOLD = 5000;                   // 初始金币
+const W = 100, H = 100;             // 地图尺寸
+const TICK_MS = 50;                 // 服务器帧率 20fps
+const START_GOLD = 5000;            // 初始金币
+const VOTE_MS = 20000;              // 刷新投票超时 20s
+
 const ID_EMPTY=0, ID_ROCK=1, ID_GOLD=2, ID_CORE_P1=3, ID_CORE_P2=4,
       ID_ROAD=10, ID_WALL=11, ID_TURRET=12, ID_CIWS=13, ID_SNIPER=14;
 
@@ -35,32 +38,33 @@ const REWARD_GOLD = 1000;
 
 const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
 const dist2 = (ax,ay,bx,by)=> (ax-bx)*(ax-bx)+(ay-by)*(ay-by);
-const angleOfDir = (dir)=> [0, Math.PI/2, Math.PI, -Math.PI/2][dir|0];
 
 /* -------------------- 单房间结构 -------------------- */
 function newRoom(){
-  return {
-    // 在线：两个玩家位与观战列表
-    players: {1:null, 2:null},            // {id, name, ws}
-    spectators: [],                        // [{ws, name}]
+  const room = {
+    id: 'GLOBAL',
+    players: {1:null, 2:null},      // {id, name, ws}
+    spectators: new Set(),          // 观战者 ws 集合
     started: false,
-
     // 世界状态
     W, H,
     map: new Uint8Array(W*H),
     hp:  new Uint16Array(W*H),
     owner: new Uint8Array(W*H),
     gold: {1:START_GOLD, 2:START_GOLD},
-    turrets: [],     // {id, role, team, x,y,w,h, cx,cy, facingDir, arcDeg, rangeCells, fireRate, bulletDamage, bulletSpeed, scatterDeg, cd}
-    bullets: [],     // {id,x,y,vx,vy,team,life,damage}
+    coreHP: {p1:HP.core, p2:HP.core},
+    turrets: [],                    // {id, role, team, x,y,w,h, cx,cy, facingDir, arcDeg, rangeCells, fireRate, bulletHP, bulletSpeed, scatterDeg, cd}
+    bullets: [],                    // {id,x,y,vx,vy,team,life}
     bulletSeq: 1,
+    pendingRefresh: null,           // {initiator:1|2, deadline:number}
     timer: null
   };
+  genMap(room);
+  return room;
 }
 const room = newRoom();
-genMap(room);
 
-/* -------------------- 地图生成 -------------------- */
+/* -------------------- 地图与核心 -------------------- */
 function setCell(room, x,y, id, hp, owner=0){
   if(x<0||y<0||x>=W||y>=H) return;
   const i = y*W+x;
@@ -72,12 +76,11 @@ function areaClear(room,x,y,w,h){
   }
 }
 function placeCore(room, team, cx, cy){
-  // 3×3 方块，中心在 cx,cy
   const x = cx-1, y = cy-1, id = (team===1)?ID_CORE_P1:ID_CORE_P2;
   for(let j=0;j<3;j++) for(let i=0;i<3;i++){
     setCell(room, x+i, y+j, id, HP.core, team);
   }
-  // 核心炮台（360°）
+  // 核心炮台
   room.turrets.push({
     id: 'core-'+team,
     role: 'core',
@@ -87,9 +90,9 @@ function placeCore(room, team, cx, cy){
     facingDir: 0,
     arcDeg: 360,
     rangeCells: 16,
-    fireRate: 2,                // 2 发/秒
-    bulletDamage: 100,          // 伤害
-    bulletSpeed: 24,            // 格/秒
+    fireRate: 2,
+    bulletHP: 100,
+    bulletSpeed: 24,
     scatterDeg: 4,
     cd: 0
   });
@@ -106,12 +109,12 @@ function genMap(room){
       }
     }
   }
-  // 金子：低频聚类
+  // 金子：聚类
   const clusters = 32;
   for(let k=0;k<clusters;k++){
     const cx = 4+Math.floor(Math.random()*(W-8));
     const cy = 4+Math.floor(Math.random()*(H-8));
-    const r  = 3+Math.floor(Math.random()*3); // 3~5
+    const r  = 3+Math.floor(Math.random()*3);
     for(let y=cy-r;y<=cy+r;y++){
       for(let x=cx-r;x<=cx+r;x++){
         if(x<0||y<0||x>=W||y>=H) continue;
@@ -123,7 +126,7 @@ function genMap(room){
     }
   }
 
-  // 放置两个核心：距边≥2格，核心中心相距 30~80 格
+  // 核心
   const valid = (cx,cy)=> cx>=2 && cy>=2 && cx<=W-3 && cy<=H-3;
   let p1=null, p2=null, tries=0;
   while(tries++<500){
@@ -135,10 +138,8 @@ function genMap(room){
   }
   if(!p1){ p1={cx:10,cy:10}; }
   if(!p2){ p2={cx:W-11,cy:H-11}; }
-
   areaClear(room, p1.cx-1, p1.cy-1, 3,3);
   areaClear(room, p2.cx-1, p2.cy-1, 3,3);
-
   placeCore(room, 1, p1.cx, p1.cy);
   placeCore(room, 2, p2.cx, p2.cy);
 }
@@ -159,7 +160,6 @@ function rectEmpty(room,x,y,w,h){
   return true;
 }
 function rectAdjToOwn(room,team,x,y,w,h){
-  // 对角可建：检查周边一圈是否存在己方建筑
   const xmin=Math.max(0,x-1), xmax=Math.min(W-1,x+w);
   const ymin=Math.max(0,y-1), ymax=Math.min(H-1,y+h);
   for(let yy=ymin;yy<=ymax;yy++){
@@ -180,20 +180,21 @@ function addTurret(room, kind, team, x,y,dir){
   const cx = x + fp.w/2, cy = y + fp.h/2;
   if(kind==='turret'){
     room.turrets.push({ id:'t'+Date.now()+Math.random(), role:'turret', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:90, rangeCells:8, fireRate:1, bulletDamage:50, bulletSpeed:22, scatterDeg:2, cd:0 });
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:90, rangeCells:8, fireRate:1, bulletHP:50, bulletSpeed:22, scatterDeg:2, cd:0 });
   }else if(kind==='ciws'){
-    const cenDir = (dir+1)&3; // 近防炮：扇形指向宽边外侧
+    const cenDir = (dir+1)&3;
     room.turrets.push({ id:'c'+Date.now()+Math.random(), role:'ciws', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:cenDir, arcDeg:180, rangeCells:3, fireRate:10, bulletDamage:50, bulletSpeed:28, scatterDeg:1, cd:0 });
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:cenDir, arcDeg:180, rangeCells:3, fireRate:10, bulletHP:50, bulletSpeed:28, scatterDeg:1, cd:0 });
   }else if(kind==='sniper'){
     room.turrets.push({ id:'s'+Date.now()+Math.random(), role:'sniper', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:45, rangeCells:20, fireRate:0.2, bulletDamage:500, bulletSpeed:36, scatterDeg:0, cd:0 });
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:45, rangeCells:20, fireRate:0.2, bulletHP:500, bulletSpeed:36, scatterDeg:0, cd:0 });
   }
 }
+
 function buildAt(room, team, kind, x,y,dir){
   const fp = footprint(kind,dir);
   if(!rectEmpty(room,x,y,fp.w,fp.h)) return false;
-  if(!rectAdjToOwn(room,team,x,y,fp.w,fp.h)) return false;
+  if(!rectAdjToOwn(room,team,x,y,fp.w,fp.h)) return false; // 仅己方邻接建造
 
   const cost = COST[kind]||0;
   if(!spend(room,team,cost)) return false;
@@ -213,9 +214,7 @@ function buildAt(room, team, kind, x,y,dir){
   }
   return true;
 }
-function removeTurretAt(room,x,y){
-  room.turrets = room.turrets.filter(t=> !(x>=t.x && y>=t.y && x<t.x+t.w && y<t.y+t.h) );
-}
+
 function demolishRect(room, team, x0,y0,x1,y1){
   const xmin=Math.max(0, Math.min(x0,x1));
   const xmax=Math.min(W-1, Math.max(x0,x1));
@@ -226,7 +225,7 @@ function demolishRect(room, team, x0,y0,x1,y1){
   for(let y=ymin;y<=ymax;y++){
     for(let x=xmin;x<=xmax;x++){
       const i=y*W+x, v=room.map[i], o=room.owner[i];
-      if(o!==team) continue; // 只能拆己方
+      if(o!==team) continue;
       if(v===ID_ROAD){ refund += COST.road*0.5; setCell(room,x,y,ID_EMPTY,0,0); }
       else if(v===ID_WALL){ refund += COST.wall*0.5; setCell(room,x,y,ID_EMPTY,0,0); }
       else if(v===ID_TURRET){ refund += COST.turret*0.5; setCell(room,x,y,ID_EMPTY,0,0); removeTurretAt(room,x,y); }
@@ -236,6 +235,9 @@ function demolishRect(room, team, x0,y0,x1,y1){
   }
   room.gold[team]+=Math.floor(refund);
 }
+function removeTurretAt(room,x,y){
+  room.turrets = room.turrets.filter(t=> !(x>=t.x && y>=t.y && x<t.x+t.w && y<t.y+t.h) );
+}
 
 /* -------------------- 射击与子弹 -------------------- */
 function withinArc(tx,ty, t){
@@ -243,8 +245,9 @@ function withinArc(tx,ty, t){
   if(dx*dx + dy*dy > t.rangeCells*t.rangeCells) return false;
   if(t.arcDeg>=360) return true;
   const ang = Math.atan2(dy,dx);
-  const center = angleOfDir(t.facingDir);
-  let d = Math.atan2(Math.sin(ang-center), Math.cos(ang-center)); // wrap [-pi,pi]
+  const centers = [0, Math.PI/2, Math.PI, -Math.PI/2];
+  const center = centers[t.facingDir|0];
+  let d = Math.atan2(Math.sin(ang-center), Math.cos(ang-center));
   const half = (t.arcDeg*Math.PI/180)/2;
   return Math.abs(d) <= half + 1e-6;
 }
@@ -270,12 +273,11 @@ function tryShoot(room, t, dt){
       const i=y*W+x, id=room.map[i]; if(id===ID_EMPTY) continue;
       const o=room.owner[i];
       if(o===t.team && (id===ID_TURRET||id===ID_CIWS||id===ID_SNIPER||id===ID_WALL||id===ID_ROAD||id===ID_CORE_P1||id===ID_CORE_P2)) continue;
-      const cx = x+0.5, cy = y+0.5;
-      if(!withinArc(cx,cy,t)) continue;
+      if(!withinArc(x+0.5,y+0.5,t)) continue;
       const s = prio(id); if(s===0) continue;
-      const d2v = dist2(t.cx,t.cy, cx,cy);
+      const d2v = dist2(t.cx,t.cy, x+0.5,y+0.5);
       if(s>bestScore || (s===bestScore && d2v<bestDist)){
-        best = {x:cx, y:cy}; bestScore=s; bestDist=d2v;
+        best = {x:x+0.5, y:y+0.5}; bestScore=s; bestDist=d2v;
       }
     }
   }
@@ -289,90 +291,36 @@ function tryShoot(room, t, dt){
     const vx = Math.cos(a)*speed;
     const vy = Math.sin(a)*speed;
     const id = room.bulletSeq++;
-    const life = t.rangeCells / speed;     // 足以飞到最远距离
-    room.bullets.push({ id, x:t.cx, y:t.cy, vx, vy, team:t.team, life, damage:t.bulletDamage||100 });
+    room.bullets.push({ id, x:t.cx, y:t.cy, vx, vy, team:t.team, life:t.rangeCells/speed });
     t.cd = 1/(t.fireRate||1);
   }
 }
-
-// 扫掠网格(DDA)碰撞：子弹不会穿过石头/金子/敌方建筑
 function stepBullets(room, dt){
-  const { map, hp, owner } = room;
-
-  for (const b of room.bullets){
+  const {map,hp,owner} = room;
+  for(let b of room.bullets){
     b.life -= dt;
-    if (b.life <= 0) { b.dead = true; continue; }
-    if ((b.vx === 0 && b.vy === 0)) { b.dead = true; continue; }
-
-    let remain = dt;
-
-    while (remain > 1e-6 && !b.dead) {
-      const vx = b.vx, vy = b.vy;
-
-      const cx = Math.floor(b.x);
-      const cy = Math.floor(b.y);
-
-      const stepX = vx > 0 ? 1 : (vx < 0 ? -1 : 0);
-      const stepY = vy > 0 ? 1 : (vy < 0 ? -1 : 0);
-
-      let tToX = Infinity, tToY = Infinity;
-      if (stepX !== 0) {
-        const nextGridX = (stepX > 0 ? (cx + 1) : cx) - b.x;
-        tToX = nextGridX / vx;
-        if (tToX < 0) tToX = Infinity;
-      }
-      if (stepY !== 0) {
-        const nextGridY = (stepY > 0 ? (cy + 1) : cy) - b.y;
-        tToY = nextGridY / vy;
-        if (tToY < 0) tToY = Infinity;
-      }
-
-      if (!isFinite(tToX) && !isFinite(tToY)) {
-        b.x += vx * remain; b.y += vy * remain; remain = 0; break;
-      }
-
-      const tStep = Math.min(remain, Math.min(tToX, tToY));
-
-      // 进入的新格
-      const enterX = cx + (tToX <= tToY ? stepX : 0);
-      const enterY = cy + (tToY <  tToX ? stepY : 0);
-
-      // 先移动到边界（略加 eps）
-      const eps = 1e-6;
-      b.x += vx * tStep; b.y += vy * tStep;
-      if (tToX <= tToY) b.x += stepX * eps; else b.y += stepY * eps;
-
-      remain -= tStep;
-
-      if (enterX < 0 || enterY < 0 || enterX >= W || enterY >= H) {
-        b.dead = true; break;
-      }
-
-      const i = enterY * W + enterX;
-      const v = map[i];
-
-      if (v !== ID_EMPTY) {
-        // 己方格可穿越；敌对/中立命中即停并结算
-        if (owner[i] !== b.team) {
-          const damage = Math.min(b.damage, hp[i]);
+    if(b.life<=0){ b.dead=true; continue; }
+    const nx = b.x + b.vx*dt;
+    const ny = b.y + b.vy*dt;
+    const cx = Math.floor(nx), cy = Math.floor(ny);
+    if(cx>=0 && cy>=0 && cx<W && cy<H){
+      const i = cy*W+cx, v=map[i];
+      if(v!==ID_EMPTY){
+        if(owner[i]!==b.team){
+          const damage = Math.min(9999, hp[i]);
           hp[i] -= damage;
-          if (hp[i] <= 0) {
-            if (v === ID_GOLD) { room.gold[b.team] += REWARD_GOLD; }
-            if (v === ID_TURRET || v === ID_CIWS || v === ID_SNIPER) { removeTurretAt(room, enterX, enterY); }
-            setCell(room, enterX, enterY, ID_EMPTY, 0, 0);
+          if(hp[i]<=0){
+            if(v===ID_GOLD){ room.gold[b.team]+=REWARD_GOLD; }
+            if(v===ID_TURRET||v===ID_CIWS||v===ID_SNIPER){ removeTurretAt(room,cx,cy); }
+            setCell(room, cx,cy, ID_EMPTY, 0, 0);
           }
-          b.dead = true;
+          b.dead=true; continue;
         }
       }
     }
+    b.x = nx; b.y = ny;
   }
   room.bullets = room.bullets.filter(b=>!b.dead);
-}
-
-function stepTurrets(room, dt){
-  for(const t of room.turrets){
-    tryShoot(room, t, dt);
-  }
 }
 
 /* -------------------- 游戏循环与广播 -------------------- */
@@ -382,6 +330,11 @@ function startGame(room){
   room.timer = setInterval(()=>{
     stepTurrets(room, TICK_MS/1000);
     stepBullets(room, TICK_MS/1000);
+    if(room.pendingRefresh && Date.now()>room.pendingRefresh.deadline){
+      const from = room.pendingRefresh.initiator;
+      room.pendingRefresh = null;
+      broadcast(room, {type:'refresh_result', ok:false, reason:'timeout', from});
+    }
     checkWin(room);
     broadcastState(room);
   }, TICK_MS);
@@ -389,6 +342,9 @@ function startGame(room){
 function stopGame(room){
   if(room.timer){ clearInterval(room.timer); room.timer=null; }
   room.started=false;
+}
+function stepTurrets(room, dt){
+  for(const t of room.turrets){ tryShoot(room, t, dt); }
 }
 function checkWin(room){
   let hasP1=false, hasP2=false;
@@ -404,13 +360,18 @@ function checkWin(room){
   }
 }
 function broadcast(room, msg){
-  // 全体：两位玩家 + 观战
-  for (const pid of [1,2]) {
+  // 两名玩家
+  for(const pid of [1,2]){
     const p = room.players[pid];
-    if(p && p.ws.readyState===WebSocket.OPEN) p.ws.send(JSON.stringify(msg));
+    if(p && p.ws.readyState===WebSocket.OPEN){
+      p.ws.send(JSON.stringify(msg));
+    }
   }
-  for (const s of room.spectators) {
-    if (s.ws.readyState===WebSocket.OPEN) s.ws.send(JSON.stringify(msg));
+  // 观战者
+  for(const ws of room.spectators){
+    if(ws.readyState===WebSocket.OPEN){
+      ws.send(JSON.stringify(msg));
+    }
   }
 }
 function statePayload(room){
@@ -418,6 +379,7 @@ function statePayload(room){
     type:'state',
     W:room.W, H:room.H,
     gold: room.gold,
+    core: room.coreHP,
     map: Array.from(room.map),
     hp:  Array.from(room.hp),
     owner: Array.from(room.owner),
@@ -425,79 +387,135 @@ function statePayload(room){
       role: t.role, team:t.team, x:t.x,y:t.y,w:t.w,h:t.h, cx:t.cx,cy:t.cy,
       facingDir:t.facingDir, arcDeg:t.arcDeg, rangeCells:t.rangeCells
     })),
-    bullets: room.bullets.map(b=>({id:b.id,x:b.x,y:b.y,vx:b.vx,vy:b.vy,team:b.team,fade:0}))
+    bullets: room.bullets.map(b=>({id:b.id,x:b.x,y:b.y,vx:b.vx,vy:b.vy,team:b.team}))
   };
 }
 function broadcastState(room){
   broadcast(room, statePayload(room));
 }
-function broadcastRoomInfo(room){
+function broadcastRoomBrief(room){
   const playerCount = (room.players[1]?1:0) + (room.players[2]?1:0);
-  const spectatorCount = room.spectators.length;
+  const spectatorCount = room.spectators.size;
   broadcast(room, { type:'room', playerCount, spectatorCount });
+}
+
+/* -------------------- 刷新投票与重置 -------------------- */
+function resetRoom(room){
+  // 重新生成世界
+  room.gold = {1:START_GOLD, 2:START_GOLD};
+  room.coreHP = {p1:HP.core, p2:HP.core};
+  room.turrets = [];
+  room.bullets = [];
+  room.bulletSeq = 1;
+  genMap(room);
+}
+function handleRefreshRequest(ws){
+  if(ws.__role!=='player' || !ws.__pid) return;
+  if(room.pendingRefresh){
+    ws.send(JSON.stringify({type:'refresh_result', ok:false, reason:'busy', from: room.pendingRefresh.initiator}));
+    return;
+  }
+  const other = ws.__pid===1 ? room.players[2] : room.players[1];
+  if(!other){
+    ws.send(JSON.stringify({type:'refresh_result', ok:false, reason:'no_opponent'}));
+    return;
+  }
+  room.pendingRefresh = { initiator: ws.__pid, deadline: Date.now()+VOTE_MS };
+  // 通知对方弹窗
+  if(other.ws.readyState===WebSocket.OPEN){
+    other.ws.send(JSON.stringify({type:'refresh_prompt', from: ws.__pid, deadline: room.pendingRefresh.deadline}));
+  }
+  // 广播进行中状态（显示在顶部/观战者可见）
+  broadcast(room, {type:'refresh_status', state:'pending', from: ws.__pid, deadline: room.pendingRefresh.deadline});
+}
+function handleRefreshVote(ws, accept){
+  if(ws.__role!=='player' || !ws.__pid) return;
+  const pr = room.pendingRefresh;
+  if(!pr) return;
+  // 只有非发起者可投票
+  if(ws.__pid === pr.initiator) return;
+
+  if(accept){
+    room.pendingRefresh = null;
+    resetRoom(room);
+    broadcast(room, {type:'refresh_result', ok:true});
+    broadcastState(room);
+  }else{
+    const from = pr.initiator;
+    room.pendingRefresh = null;
+    broadcast(room, {type:'refresh_result', ok:false, reason:'rejected', from});
+  }
 }
 
 /* -------------------- 连接与消息 -------------------- */
 wss.on('connection', (ws)=>{
+  // 分配：P1/P2/观战
+  if(!room.players[1]){
+    room.players[1] = { id:1, name:'P1', ws };
+    ws.__role='player'; ws.__pid=1;
+  }else if(!room.players[2]){
+    room.players[2] = { id:2, name:'P2', ws };
+    ws.__role='player'; ws.__pid=2;
+  }else{
+    room.spectators.add(ws);
+    ws.__role='spectator'; ws.__pid=0;
+  }
+
+  // start
+  const startMsg = { type:'start', role: ws.__role, W, H };
+  if(ws.__role==='player') startMsg.you = ws.__pid;
+  ws.send(JSON.stringify(startMsg));
+
+  broadcastRoomBrief(room);
+  if(!room.started) startGame(room);
+
   ws.on('message', (buf)=>{
     let m; try{ m=JSON.parse(buf.toString()); }catch{ return; }
 
     if(m.type==='join'){
-      const name = String(m.name||'Guest');
-
-      // 分配：若有空位→玩家；否则→观战
-      let role = 'spectator';
-      let pid  = 0;
-      if(!room.players[1]){ role='player'; pid=1; room.players[1]={id:1,name,ws}; ws.__pid=1; }
-      else if(!room.players[2]){ role='player'; pid=2; room.players[2]={id:2,name,ws}; ws.__pid=2; }
-      else{ role='spectator'; pid=0; room.spectators.push({ws,name}); }
-
-      ws.__role = role;
-
-      // 启动与同步
-      if(!room.started) startGame(room);
-      ws.send(JSON.stringify({type:'start', role, you:pid, W, H}));
-      ws.send(JSON.stringify(statePayload(room)));
-      broadcastRoomInfo(room);
+      // 兼容旧客户端（当前已在 on connection 完成分配），忽略
       return;
     }
 
-    if(m.type==='build' || m.type==='demolish'){
-      if(ws.__role!=='player') return; // 观战者无权操作
-    }
-
-    if(m.type==='build'){
-      const pid = ws.__pid|0;
+    if(m.type==='build' && ws.__role==='player'){
       const {kind,x,y,dir} = m;
-      if(buildAt(room, pid, kind, x|0, y|0, (dir|0)&3)){
+      if(buildAt(room, ws.__pid, kind, x|0, y|0, (dir|0)&3)){
         broadcastState(room);
       }
       return;
     }
 
-    if(m.type==='demolish'){
-      const pid = ws.__pid|0;
+    if(m.type==='demolish' && ws.__role==='player'){
       const {x0,y0,x1,y1} = m;
-      demolishRect(room, pid, x0|0,y0|0,x1|0,y1|0);
+      demolishRect(room, ws.__pid, x0|0,y0|0,x1|0,y1|0);
       broadcastState(room);
+      return;
+    }
+
+    if(m.type==='refresh_request'){
+      handleRefreshRequest(ws);
+      return;
+    }
+
+    if(m.type==='refresh_vote'){
+      handleRefreshVote(ws, !!m.accept);
       return;
     }
   });
 
   ws.on('close', ()=>{
-    const role = ws.__role;
-    if(role==='player'){
-      const pid = ws.__pid|0;
-      if(pid===1 || pid===2){
-        room.players[pid] = null;
-      }
+    if(ws.__role==='player'){
+      const pid=ws.__pid;
+      if(pid) room.players[pid]=null;
     }else{
-      room.spectators = room.spectators.filter(s => s.ws !== ws);
+      room.spectators.delete(ws);
     }
-    broadcastRoomInfo(room);
-    // 无玩家且无人观战时可停表
-    if(!room.players[1] && !room.players[2] && room.spectators.length===0){
-      stopGame(room);
+    broadcastRoomBrief(room);
+    if(!room.players[1] && !room.players[2]){ stopGame(room); }
+    // 若投票进行中且有一方离线，则视为超时
+    if(room.pendingRefresh){
+      const other = room.pendingRefresh.initiator===1 ? room.players[2] : room.players[1];
+      if(!other){ room.pendingRefresh=null; broadcast(room,{type:'refresh_result', ok:false, reason:'timeout'}); }
     }
   });
 });

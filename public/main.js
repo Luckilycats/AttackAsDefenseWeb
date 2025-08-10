@@ -1,4 +1,4 @@
-// main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色显示
+// main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色 + 刷新投票
 // 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
 // 性能：Path2D 箭头、子弹批量绘制、装饰层自适应跳过；子弹瞬间消失
 // 已移除音效功能
@@ -57,15 +57,24 @@ topbar?.appendChild(youEl);
 topbar?.appendChild(roomEl);
 topbar?.appendChild(teamEl);
 
-/* ===== 攻击范围开关按钮 ===== */
+/* ===== 左侧按钮：攻击范围 / 刷新地图 ===== */
 const btnToggleArcs = document.createElement('button');
 btnToggleArcs.textContent='显示攻击范围';
 Object.assign(btnToggleArcs.style,{
-  position:'fixed',left:'12px',top:'50%',transform:'translateY(-50%)',
+  position:'fixed',left:'12px',top:'46%',transform:'translateY(-50%)',
   padding:'8px 10px',border:'1px solid #666',background:'#1f1f1f',
   color:'#eaeaea',cursor:'pointer',zIndex:9999,borderRadius:'6px'
 });
 document.body.appendChild(btnToggleArcs);
+
+const btnRefresh = document.createElement('button');
+btnRefresh.textContent='刷新地图';
+Object.assign(btnRefresh.style,{
+  position:'fixed',left:'12px',top:'56%',transform:'translateY(-50%)',
+  padding:'8px 10px',border:'1px solid #666',background:'#1f1f1f',
+  color:'#eaeaea',cursor:'pointer',zIndex:9999,borderRadius:'6px',display:'none'
+});
+document.body.appendChild(btnRefresh);
 
 /* ====================== 常量/工具 ====================== */
 const CELL=8;
@@ -95,6 +104,11 @@ let isMouseDown=false, selecting=false;
 let selectStart=null, selectEnd=null;
 let activePointerId=null;
 
+/* ===== 刷新投票本地状态 ===== */
+let refreshPending = false;
+let refreshDeadline = 0;
+let refreshTicker = null;
+
 /* ====================== 服务器快照 ====================== */
 const S = {
   you: 0, W:100, H:100,
@@ -120,12 +134,36 @@ btnToggleArcs.onclick = ()=>{
   showArcs=!showArcs;
   btnToggleArcs.textContent = showArcs?'隐藏攻击范围':'显示攻击范围';
 };
+
+btnRefresh.onclick = ()=>{
+  if(ROLE!=='player' || refreshPending) return;
+  Net.refreshRequest();
+  setRefreshPending(true, null);
+};
+
+function setRefreshPending(pending, deadline){
+  refreshPending = pending;
+  refreshDeadline = deadline || 0;
+  if(ROLE==='player'){
+    btnRefresh.disabled = pending;
+    btnRefresh.textContent = pending ? '等待同意…' : '刷新地图';
+  }
+  // 倒计时提示（观感），可选
+  if(refreshTicker){ clearInterval(refreshTicker); refreshTicker=null; }
+  if(pending && deadline){
+    refreshTicker = setInterval(()=>{
+      const left = Math.max(0, Math.ceil((deadline - Date.now())/1000));
+      if(left<=0){ clearInterval(refreshTicker); refreshTicker=null; }
+      if(ROLE==='player'){ btnRefresh.textContent = `等待同意…（${left}s）`; }
+    }, 500);
+  }
+}
+
 function labelOf(t){ return t==='road'?'道路':t==='wall'?'围墙':t==='turret'?'基础炮':t==='ciws'?'近防炮':t==='sniper'?'狙击炮':''; }
 function updateHUD(){
   if(ROLE==='player'){
     goldEl.textContent=S.gold[S.you]||0;
     youEl.textContent=S.you?`你是：P${S.you}`:'';
-    // 阵营颜色：P1=蓝；P2=红
     if (S.you===1){
       teamEl.textContent = '阵营颜色：蓝';
       teamEl.style.borderColor = COLOR.ally;
@@ -195,8 +233,6 @@ function initUI(){
     else if(k==='r'){ if(mode==='build'&&selectedType){ buildFacingDir=(buildFacingDir+1)&3; } }
     else if(e.key==='Escape'||e.key==='Esc') enterBrowseMode();
   });
-
-  // 不在此处根据 ROLE 禁用按钮，等待 Net.onStart 后处理
 }
 
 /* ====================== 坐标/取色/校验 ====================== */
@@ -236,7 +272,7 @@ function inBounds(x,y){ return x>=0&&y>=0&&x<S.W&&y<S.H; }
 function rectInBounds(x,y,w,h){ return x>=0&&y>=0&&(x+w)<=S.W&&(y+h)<=S.H; }
 function areaEmptyClient(x,y,w,h){ for(let j=0;j<h;j++)for(let i=0;i<w;i++){ if(S.map[(y+j)*S.W+(x+i)]!==0) return false; } return true; }
 
-/* 仅允许在“己方建筑相邻”处建造（四周一圈含对角），与服务端一致 */
+/* 仅允许在“己方建筑相邻”处建造 */
 function rectCanBuildHereClient(x,y,w,h){
   const xmin=Math.max(0,x-1), xmax=Math.min(S.W-1,x+w);
   const ymin=Math.max(0,y-1), ymax=Math.min(S.H-1,y+h);
@@ -248,7 +284,7 @@ function rectCanBuildHereClient(x,y,w,h){
       const v=S.map[i];
       const o=S.owner[i];
       const isBuilding = (v===3||v===4||v===10||v===11||v===12||v===13||v===14);
-      if(isBuilding && o===S.you) return true;   // 关键：必须相邻己方建筑
+      if(isBuilding && o===S.you) return true;
     }
   }
   return false;
@@ -366,10 +402,9 @@ function consumeCellQueue(){
   }
 }
 
-/* ====================== 自动联机（等待 Net 注入） ====================== */
+/* ====================== 自动联机 ====================== */
 function connectOnlineAuto(){
-  const params=new URLSearchParams(window.location.search);
-  const name=params.get('name') || ('Guest-'+Math.random().toString(36).slice(2,6).toUpperCase());
+  const name='Guest-'+Math.random().toString(36).slice(2,6).toUpperCase();
 
   Net.onRoom = (m)=>{ updateRoomLabel(m.playerCount||0, m.spectatorCount||0); };
   Net.onStart = (m)=>{
@@ -379,13 +414,16 @@ function connectOnlineAuto(){
     canvas.width=S.W*CELL; canvas.height=S.H*CELL;
     bgDirty=true; updateHUD();
 
-    // 按身份启用/禁用控件；观战强制回浏览模式
     const controls = [...buildButtons, btnDemo, btnCancel];
     if (ROLE === 'spectator') {
       controls.forEach(b => b.setAttribute('disabled','disabled'));
+      btnRefresh.style.display='none';
       enterBrowseMode();
     } else {
       controls.forEach(b => b.removeAttribute('disabled'));
+      btnRefresh.style.display='block';
+      btnRefresh.disabled = false;
+      btnRefresh.textContent='刷新地图';
     }
   };
   Net.onState = (m)=>{
@@ -398,6 +436,31 @@ function connectOnlineAuto(){
   };
   Net.onEnded = (m)=>{ toast(m.winner===S.you?'你获胜':'你失败',3000); };
   Net.onError = (e)=>{ alert('联机错误：'+(e.code||'UNKNOWN')); };
+
+  // 刷新投票消息
+  Net.onRefreshPrompt = (m)=>{
+    if(ROLE==='player'){
+      const ok = confirm('对方请求刷新地图，是否同意？（20 秒内有效）');
+      Net.refreshVote(!!ok);
+    }
+  };
+  Net.onRefreshStatus = (m)=>{
+    setRefreshPending(true, m.deadline||0);
+    toast('刷新投票进行中', 1500);
+  };
+  Net.onRefreshResult = (m)=>{
+    setRefreshPending(false, 0);
+    if(m.ok){
+      // 清理本地瞬态
+      Local.bullets.clear(); Local.arr=[];
+      Ghost.items.clear(); Ghost.pendingSet.clear(); Ghost.queue.length=0; Ghost.cellQueue.length=0;
+      bgDirty=true;
+      toast('地图已刷新', 1500);
+    }else{
+      const msg = m.reason==='rejected'?'对方已拒绝刷新':m.reason==='timeout'?'刷新请求已超时':m.reason==='busy'?'已有进行中的刷新投票':'刷新失败';
+      toast(msg, 1500);
+    }
+  };
 
   (function waitNet(){
     if (window.Net && typeof Net.connect==='function') Net.connect({ name });
@@ -504,6 +567,7 @@ function draw(){
     for(const t of S.turrets){ if(t.role==='core') continue; const color=(t.team===1)?COLOR.ally:COLOR.enemy; drawArrowFast(t.cx*CELL,t.cy*CELL,t.facingDir,Math.min(t.w,t.h)*CELL*0.9,color,0.95); }
   }
 
+  // 幽灵
   drawGhosts();
 
   // 子弹批量绘制
@@ -552,7 +616,6 @@ function loop(ts){
 /* ====================== 启动 ====================== */
 function initAll(){
   initUI(); initPointer(); updateHUD();
-  // 等页面与脚本加载完，再触发自动联机（确保 Net 已注入）
   window.addEventListener('load', () => setTimeout(connectOnlineAuto, 0));
   requestAnimationFrame(loop);
 }
@@ -563,19 +626,31 @@ initAll();
   if (window.Net) return;
   const Net = {}; let ws=null;
   Net.onRoom=()=>{}; Net.onStart=()=>{}; Net.onState=()=>{}; Net.onEnded=()=>{}; Net.onError=(e)=>{console.error(e);};
+  Net.onRefreshPrompt=()=>{}; Net.onRefreshStatus=()=>{}; Net.onRefreshResult=()=>{};
 
   Net.connect=function({name='Guest'}={}){
     ws=new WebSocket(WS_URL);
     ws.onopen=()=>{ ws.send(JSON.stringify({type:'join', name})); };
     ws.onmessage=(ev)=>{ let m; try{ m=JSON.parse(ev.data);}catch{ return; }
-      switch(m.type){ case 'room': Net.onRoom(m); break; case 'start': Net.onStart(m); break;
-        case 'state': Net.onState(m); break; case 'ended': Net.onEnded(m); break; default: break; } };
+      switch(m.type){
+        case 'room': Net.onRoom(m); break;
+        case 'start': Net.onStart(m); break;
+        case 'state': Net.onState(m); break;
+        case 'ended': Net.onEnded(m); break;
+        case 'refresh_prompt': Net.onRefreshPrompt(m); break;
+        case 'refresh_status': Net.onRefreshStatus(m); break;
+        case 'refresh_result': Net.onRefreshResult(m); break;
+        default: break;
+      }
+    };
     ws.onerror=(e)=>Net.onError(e);
     ws.onclose=()=>{};
     Net._ws=ws;
   };
-  Net.ready=function(){}; // 单房间无 ready
+  Net.ready=function(){};
   Net.build=function(kind,x,y,dir){ ws && ws.send(JSON.stringify({type:'build',kind,x,y,dir})); };
   Net.demolish=function(x0,y0,x1,y1){ ws && ws.send(JSON.stringify({type:'demolish',x0,y0,x1,y1})); };
+  Net.refreshRequest=function(){ ws && ws.send(JSON.stringify({type:'refresh_request'})); };
+  Net.refreshVote=function(accept){ ws && ws.send(JSON.stringify({type:'refresh_vote', accept: !!accept})); };
   window.Net=Net;
 })();
