@@ -1,6 +1,7 @@
 // server.js — 单房间：静态托管 + 同端口 WebSocket + 地图生成 + 对战逻辑 + 刷新投票
 // 广播节流：逻辑 20fps，状态广播 5fps；事件仍即时广播
 // 子弹碰撞：DDA 逐格扫描，阻挡石头/金子/敌方建筑
+// 结束后 5 秒自动刷新地图并重开一局
 
 const path = require('path');
 const http = require('http');
@@ -102,7 +103,7 @@ function genMap(room){
   const {map,hp,owner} = room;
   map.fill(0); hp.fill(0); owner.fill(0);
 
-  // 石头：~40% 随机撒点（保持原样）
+  // 石头：~40% 随机撒点
   for(let y=0;y<H;y++){
     for(let x=0;x<W;x++){
       if(Math.random()<0.40){
@@ -434,6 +435,13 @@ function checkWin(room){
     const winner = hasP1 ? 1 : hasP2 ? 2 : 0;
     broadcast(room, {type:'ended', winner});
     stopGame(room);
+
+    // 5 秒后自动刷新地图并重启一局
+    setTimeout(() => {
+      resetRoom(room);
+      startGame(room);
+      broadcastState(room);
+    }, 5000);
   }
 }
 function broadcast(room, msg){
@@ -491,7 +499,7 @@ function resetRoom(room){
   room.bullets = [];
   room.bulletSeq = 1;
   genMap(room);
-  broadcastState(room); // 立即一次，避免等节流
+  broadcastState(room); // 立即一次
 }
 function handleRefreshRequest(ws){
   if(ws.__role!=='player' || !ws.__pid) return;

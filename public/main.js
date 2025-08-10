@@ -1,6 +1,6 @@
 // main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色 + 刷新投票
 // 绘制优化：更激进抽样与装饰层跳过；子弹瞬间消失；BG 仅脏时重绘
-// 注意：协议不变
+// 结束时中央放大显示结果，5 秒后服务器自动刷新地图，收到新状态后自动隐藏覆盖层
 
 /* ====================== 画布与 UI ====================== */
 const canvas = document.getElementById('game');
@@ -74,6 +74,32 @@ Object.assign(btnRefresh.style,{
   color:'#eaeaea',cursor:'pointer',zIndex:9999,borderRadius:'6px',display:'none'
 });
 document.body.appendChild(btnRefresh);
+
+/* ===== 结束结果覆盖层（新增） ===== */
+const endOverlay = document.createElement('div');
+Object.assign(endOverlay.style, {
+  position: 'fixed', left: '0', top: '0', right: '0', bottom: '0',
+  display: 'none', alignItems: 'center', justifyContent: 'center',
+  background: 'rgba(0,0,0,0.55)', zIndex: 10000, textAlign: 'center', padding: '24px'
+});
+const endTitle = document.createElement('div');
+Object.assign(endTitle.style, { color:'#fff', fontSize:'56px', fontWeight:'800', lineHeight:'1.25', textShadow:'0 2px 8px rgba(0,0,0,0.6)' });
+const endSub = document.createElement('div');
+Object.assign(endSub.style, { marginTop:'12px', fontSize:'18px', opacity:0.9, color:'#fff' });
+endOverlay.appendChild(endTitle); endOverlay.appendChild(endSub);
+document.body.appendChild(endOverlay);
+
+let _awaitingAutoRefresh = false;
+function showEndOverlay(text, sub='5 秒后自动刷新地图…'){
+  endTitle.textContent = text;
+  endSub.textContent = sub;
+  endOverlay.style.display = 'flex';
+  _awaitingAutoRefresh = true;
+}
+function hideEndOverlay(){
+  endOverlay.style.display = 'none';
+  _awaitingAutoRefresh = false;
+}
 
 /* ====================== 常量/工具 ====================== */
 const CELL=8;
@@ -234,7 +260,7 @@ function initUI(){
 }
 
 /* ====================== 坐标/取色/校验 ====================== */
-const CELL_F = CELL; // 常量别名，便于 JIT
+const CELL_F = CELL;
 function pointerToCell(e){ const r=canvas.getBoundingClientRect(); const px=e.clientX-r.left, py=e.clientY-r.top; return {px,py,mx:Math.floor(px/CELL_F),my:Math.floor(py/CELL_F)}; }
 function getFootprint(type, dir){
   if(type==='turret') return {w:2,h:2};
@@ -426,15 +452,27 @@ function connectOnlineAuto(){
     }
   };
   Net.onState = (m)=>{
-    // S.hp 在前端不参与绘制与判定，但沿用协议
     S.gold=m.gold; S.core=m.core;
     S.map=new Uint8Array(m.map); S.hp=new Uint16Array(m.hp); S.owner=new Uint8Array(m.owner);
     S.turrets=m.turrets; bgDirty=true;
     reconcileBulletsFromServer(m.bullets);
     updateHUD();
     reconcileGhostsWithServer();
+
+    // 收到新状态后，若处于等待自动刷新阶段，则隐藏覆盖层
+    if (_awaitingAutoRefresh) hideEndOverlay();
   };
-  Net.onEnded = (m)=>{ toast(m.winner===S.you?'你获胜':'你失败',3000); };
+  Net.onEnded = (m)=>{
+    let text = '平局';
+    if (S.you && m.winner) {
+      text = (m.winner === S.you) ? '你获胜' : '你失败';
+    } else if (m.winner === 1) {
+      text = 'P1 获胜';
+    } else if (m.winner === 2) {
+      text = 'P2 获胜';
+    }
+    showEndOverlay(text, '5 秒后自动刷新地图…');
+  };
   Net.onError = (e)=>{ alert('联机错误：'+(e.code||'UNKNOWN')); };
 
   // 刷新投票消息
@@ -498,7 +536,6 @@ function reconcileBulletsFromServer(list){
     }
   }
   for(const [id] of Local.bullets){ if(!seen.has(id)) Local.bullets.delete(id); }
-  // 构建线性数组供批量绘制
   Local.arr = Array.from(Local.bullets.values());
 }
 function updateLocal(dt){
@@ -542,7 +579,6 @@ function drawGhosts(){
   if(_skipDecor) return;
   for(const g of Ghost.items.values()){
     const arc=(g.type==='turret')?90:(g.type==='ciws')?180:(g.type==='sniper')?45:(g.type==='core')?360:0;
-    // 与服务器一致：turret=16, ciws=6, sniper=40, core=16
     const range=(g.type==='turret')?16:(g.type==='ciws')?6:(g.type==='sniper')?40:(g.type==='core')?16:0;
     if(arc>0){
       const cenDir=(g.type==='ciws')?((g.dir+1)&3):g.dir;
@@ -614,13 +650,12 @@ function loop(ts){
   const t0=performance.now();
   const dt=Math.min(0.05,(ts-_rafLast)/1000); _rafLast=ts;
   consumeCellQueue(); flushBuildQueue(); updateLocal(dt); draw();
-  const used=performance.now()-t0; _lastFrameCostMs=used; _skipDecor = used>14; // 更激进：>14ms 即跳过装饰
+  const used=performance.now()-t0; _lastFrameCostMs=used; _skipDecor = used>14;
   requestAnimationFrame(loop);
 }
 
 /* ====================== 启动 ====================== */
 function initAll(){
-  // 降低抗锯齿成本
   ctx.imageSmoothingEnabled = false;
   initUI(); initPointer(); updateHUD();
   window.addEventListener('load', () => setTimeout(connectOnlineAuto, 0));
