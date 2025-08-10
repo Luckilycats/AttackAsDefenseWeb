@@ -1,6 +1,7 @@
 // main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数显示
 // 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
 // 性能：Path2D 箭头、子弹批量绘制、装饰层自适应跳过；子弹瞬间消失
+// 已移除音效功能
 
 /* ====================== 画布与 UI ====================== */
 const canvas = document.getElementById('game');
@@ -99,12 +100,6 @@ const Ghost = {
 
 /* ====================== 背景缓存 ====================== */
 let bgCanvas=null, bgCtx=null, bgDirty=true;
-
-/* ====================== 简易音效 ====================== */
-let AC=null;
-function ac(){ if(!AC){ AC=new (window.AudioContext||window.webkitAudioContext)(); } return AC; }
-function beep(f=600,t=0.06,v=0.08){ try{const a=ac(),o=a.createOscillator(),g=a.createGain();o.type='square';o.frequency.value=f;g.gain.value=v;o.connect(g);g.connect(a.destination);const now=a.currentTime;o.start(now);o.stop(now+t);}catch{} }
-function sfx_fire(){ beep(760,0.04,0.06); }
 
 /* ====================== 事件/UI ====================== */
 btnToggleArcs.onclick = ()=>{
@@ -356,13 +351,12 @@ function connectOnlineAuto(){
     }
   };
   Net.onState = (m)=>{
-    const had=Local.bullets.size;
     S.gold=m.gold; S.core=m.core;
     S.map=new Uint8Array(m.map); S.hp=new Uint16Array(m.hp); S.owner=new Uint8Array(m.owner);
     S.turrets=m.turrets; bgDirty=true;
     reconcileBulletsFromServer(m.bullets);
-    if(Local.bullets.size>had) sfx_fire();
-    updateHUD(); reconcileGhostsWithServer();
+    updateHUD();
+    reconcileGhostsWithServer();
   };
   Net.onEnded = (m)=>{ toast(m.winner===S.you?'你获胜':'你失败',3000); };
   Net.onError = (e)=>{ alert('联机错误：'+(e.code||'UNKNOWN')); };
