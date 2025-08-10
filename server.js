@@ -1,7 +1,7 @@
 // server.js — 单房间：静态托管 + 同端口 WebSocket + 地图生成 + 对战逻辑 + 刷新投票
 // 消息：join / start / room / state / ended
-// 新增：refresh_request / refresh_prompt / refresh_status / refresh_vote / refresh_result
-// 修复：子弹“隧穿”——使用网格 DDA 对本帧位移做逐格碰撞检测，阻挡石头/金子/敌方建筑
+// 刷新投票：refresh_request / refresh_prompt / refresh_status / refresh_vote / refresh_result
+// 子弹碰撞：DDA 逐格扫描，阻挡石头/金子/敌方建筑
 
 const path = require('path');
 const http = require('http');
@@ -80,7 +80,7 @@ function placeCore(room, team, cx, cy){
   for(let j=0;j<3;j++) for(let i=0;i<3;i++){
     setCell(room, x+i, y+j, id, HP.core, team);
   }
-  // 核心炮台
+  // 核心炮台（保持 16 格）
   room.turrets.push({
     id: 'core-'+team,
     role: 'core',
@@ -89,7 +89,7 @@ function placeCore(room, team, cx, cy){
     cx: cx+0.0, cy: cy+0.0,
     facingDir: 0,
     arcDeg: 360,
-    rangeCells: 16,
+    rangeCells: 16,      // 不变
     fireRate: 2,
     bulletHP: 100,
     bulletSpeed: 24,
@@ -109,24 +109,24 @@ function genMap(room){
       }
     }
   }
-  // 金子：低频聚类（仅降低“刷新概率”，其余参数不改）
-  const clusters = 32;              // 保持原值
+  // 金子：低频聚类（仅降低概率）
+  const clusters = 32;
   for(let k=0;k<clusters;k++){
     const cx = 4+Math.floor(Math.random()*(W-8));
     const cy = 4+Math.floor(Math.random()*(H-8));
-    const r  = 3+Math.floor(Math.random()*3); // 3~5，保持原值
+    const r  = 3+Math.floor(Math.random()*3); // 3~5
     for(let y=cy-r;y<=cy+r;y++){
       for(let x=cx-r;x<=cx+r;x++){
         if(x<0||y<0||x>=W||y>=H) continue;
         const d2=(x-cx)*(x-cx)+(y-cy)*(y-cy);
-        if(d2<=r*r && Math.random()<0.25){    // ★ 仅此处从 0.55 下调为 0.25
+        if(d2<=r*r && Math.random()<0.25){ // 从 0.55 下调为 0.25
           setCell(room,x,y,ID_GOLD,HP[ID_GOLD],0);
         }
       }
     }
   }
 
-  // 放置两个核心（保持原逻辑）
+  // 核心放置（保持原逻辑）
   const valid = (cx,cy)=> cx>=2 && cy>=2 && cx<=W-3 && cy<=H-3;
   let p1=null, p2=null, tries=0;
   while(tries++<500){
@@ -138,14 +138,12 @@ function genMap(room){
   }
   if(!p1){ p1={cx:10,cy:10}; }
   if(!p2){ p2={cx:W-11,cy:H-11}; }
-
-  // 清空核心 3×3 区域并放置核心（保持原逻辑）
   areaClear(room, p1.cx-1, p1.cy-1, 3,3);
   areaClear(room, p2.cx-1, p2.cy-1, 3,3);
   placeCore(room, 1, p1.cx, p1.cy);
   placeCore(room, 2, p2.cx, p2.cy);
 
-  // ★ 新增：将剩余空地全部填成石头（不改已放置的金子与核心）
+  // 剩余空地全部填石头
   for(let y=0;y<H;y++){
     for(let x=0;x<W;x++){
       const i = y*W + x;
@@ -192,14 +190,14 @@ function addTurret(room, kind, team, x,y,dir){
   const cx = x + fp.w/2, cy = y + fp.h/2;
   if(kind==='turret'){
     room.turrets.push({ id:'t'+Date.now()+Math.random(), role:'turret', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:90, rangeCells:8, fireRate:1, bulletHP:50, bulletSpeed:22, scatterDeg:2, cd:0 });
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:90, rangeCells:16, fireRate:1, bulletHP:50, bulletSpeed:22, scatterDeg:2, cd:0 }); // 8→16
   }else if(kind==='ciws'){
     const cenDir = (dir+1)&3;
     room.turrets.push({ id:'c'+Date.now()+Math.random(), role:'ciws', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:cenDir, arcDeg:180, rangeCells:3, fireRate:10, bulletHP:50, bulletSpeed:28, scatterDeg:1, cd:0 });
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:cenDir, arcDeg:180, rangeCells:6, fireRate:10, bulletHP:50, bulletSpeed:28, scatterDeg:1, cd:0 }); // 3→6
   }else if(kind==='sniper'){
     room.turrets.push({ id:'s'+Date.now()+Math.random(), role:'sniper', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:45, rangeCells:20, fireRate:0.2, bulletHP:500, bulletSpeed:36, scatterDeg:0, cd:0 });
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:45, rangeCells:40, fireRate:0.2, bulletHP:500, bulletSpeed:36, scatterDeg:0, cd:0 }); // 20→40
   }
 }
 
@@ -251,7 +249,7 @@ function removeTurretAt(room,x,y){
   room.turrets = room.turrets.filter(t=> !(x>=t.x && y>=t.y && x<t.x+t.w && y<t.y+t.h) );
 }
 
-/* -------------------- 射击与子弹（包含 DDA 碰撞） -------------------- */
+/* -------------------- 射击与子弹（含 DDA 碰撞） -------------------- */
 function withinArc(tx,ty, t){
   const dx = tx - t.cx, dy = ty - t.cy;
   if(dx*dx + dy*dy > t.rangeCells*t.rangeCells) return false;
@@ -307,7 +305,7 @@ function tryShoot(room, t, dt){
   }
 }
 
-/* === 逐格 DDA 扫描，返回首个可命中的格 === */
+/* === DDA 扫描首个命中格 === */
 function sweepHitCell(room, x0, y0, x1, y1, team) {
   const W = room.W, H = room.H;
 
@@ -534,7 +532,7 @@ wss.on('connection', (ws)=>{
     let m; try{ m=JSON.parse(buf.toString()); }catch{ return; }
 
     if(m.type==='join'){
-      return; // 兼容旧客户端，忽略
+      return; // 兼容旧客户端
     }
 
     if(m.type==='build' && ws.__role==='player'){

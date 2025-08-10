@@ -1,7 +1,8 @@
 // main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色 + 刷新投票
 // 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
 // 性能：Path2D 箭头、子弹批量绘制、装饰层自适应跳过；子弹瞬间消失
-// 已移除音效与小地图
+// 音效与小地图已移除
+// 本次同步：建造预览与幽灵扇形范围与服务端一致（turret=16, ciws=6, sniper=40, core=16）
 
 /* ====================== 画布与 UI ====================== */
 const canvas = document.getElementById('game');
@@ -540,15 +541,17 @@ function drawGhosts(){
   if(_skipDecor) return;
   for(const g of Ghost.items.values()){
     const arc=(g.type==='turret')?90:(g.type==='ciws')?180:(g.type==='sniper')?45:(g.type==='core')?360:0;
-    const range=(g.type==='turret')?8:(g.type==='ciws')?3:(g.type==='sniper')?20:(g.type==='core')?16:0;
-    if(arc<=0) return;
-    const cenDir=(g.type==='ciws')?((g.dir+1)&3):g.dir;
-    const cx=(g.x+g.w*0.5)*CELL, cy=(g.y+g.h*0.5)*CELL, r=range*CELL;
-    ctx.save(); ctx.globalAlpha=0.16; ctx.fillStyle=(g.team===1)?COLOR.allyLight:COLOR.enemyLight;
-    if(arc<360){ const center=DIR_TO_RAD[cenDir|0]; ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2; ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); }
-    else{ ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); }
-    ctx.restore();
-    if(g.type!=='core'){ drawArrowFast(cx,cy,cenDir,Math.min(g.w,g.h)*CELL*0.9,(g.team===1)?COLOR.ally:COLOR.enemy,0.9); }
+    // 同步：turret=16, ciws=6, sniper=40, core=16
+    const range=(g.type==='turret')?16:(g.type==='ciws')?6:(g.type==='sniper')?40:(g.type==='core')?16:0;
+    if(arc>0){
+      const cenDir=(g.type==='ciws')?((g.dir+1)&3):g.dir;
+      const cx=(g.x+g.w*0.5)*CELL, cy=(g.y+g.h*0.5)*CELL, r=range*CELL;
+      ctx.save(); ctx.globalAlpha=0.16; ctx.fillStyle=(g.team===1)?COLOR.allyLight:COLOR.enemyLight;
+      if(arc<360){ const center=DIR_TO_RAD[cenDir|0]; ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2; ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); }
+      else{ ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); }
+      ctx.restore();
+      if(g.type!=='core'){ drawArrowFast(cx,cy,cenDir,Math.min(g.w,g.h)*CELL*0.9,(g.team===1)?COLOR.ally:COLOR.enemy,0.9); }
+    }
   }
 }
 function draw(){
@@ -557,7 +560,9 @@ function draw(){
   if(showArcs && !_skipDecor){
     for(const t of S.turrets){
       const r=t.rangeCells*CELL, colorFill=(t.team===1)?COLOR.allyLight:COLOR.enemyLight;
-      if(t.arcDeg<360){ const center=DIR_TO_RAD[t.facingDir|0]; ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill; ctx.beginPath(); const a0=center-deg2rad(t.arcDeg)/2, a1=center+deg2rad(t.arcDeg)/2; ctx.moveTo(t.cx*CELL,t.cy*CELL); ctx.arc(t.cx*CELL,t.cy*CELL,r,a0,a1); ctx.closePath(); ctx.fill(); ctx.restore(); }
+      if(t.arcDeg<360){ const center=DIR_TO_RAD[t.facingDir|0]; ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill;
+        ctx.beginPath(); const a0=center-deg2rad(t.arcDeg)/2, a1=center+deg2rad(t.arcDeg)/2; ctx.moveTo(t.cx*CELL,t.cy*CELL); ctx.arc(t.cx*CELL,t.cy*CELL,r,a0,a1);
+        ctx.closePath(); ctx.fill(); ctx.restore(); }
       else{ ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill; ctx.beginPath(); ctx.arc(t.cx*CELL,t.cy*CELL,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore(); }
     }
   }
@@ -583,7 +588,8 @@ function draw(){
 
     if(!_skipDecor){
       const arc=(selectedType==='turret')?90:(selectedType==='ciws')?180:(selectedType==='sniper')?45:(selectedType==='core')?360:0;
-      const range=(selectedType==='turret')?8:(selectedType==='ciws')?3:(selectedType==='sniper')?20:(selectedType==='core')?16:0;
+      // 同步：turret=16, ciws=6, sniper=40, core=16
+      const range=(selectedType==='turret')?16:(selectedType==='ciws')?6:(selectedType==='sniper')?40:(selectedType==='core')?16:0;
       if(arc>0){
         const cx=(hoverX+fp.w*0.5)*CELL, cy=(hoverY+fp.h*0.5)*CELL;
         const cenDir=(selectedType==='ciws')?((buildFacingDir+1)&3):buildFacingDir;
