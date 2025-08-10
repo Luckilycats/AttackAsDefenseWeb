@@ -1,7 +1,7 @@
 // main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色 + 刷新投票
 // 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
 // 性能：Path2D 箭头、子弹批量绘制、装饰层自适应跳过；子弹瞬间消失
-// 已移除小地图与全部音效
+// 已移除音效与小地图
 
 /* ====================== 画布与 UI ====================== */
 const canvas = document.getElementById('game');
@@ -271,7 +271,7 @@ function inBounds(x,y){ return x>=0&&y>=0&&x<S.W&&y<S.H; }
 function rectInBounds(x,y,w,h){ return x>=0&&y>=0&&(x+w)<=S.W&&(y+h)<=S.H; }
 function areaEmptyClient(x,y,w,h){ for(let j=0;j<h;j++)for(let i=0;i<w;i++){ if(S.map[(y+j)*S.W+(x+i)]!==0) return false; } return true; }
 
-/* 仅允许在“己方建筑相邻”处建造 */
+/* 仅允许在“己方建筑相邻”处建造（客户端粗校验） */
 function rectCanBuildHereClient(x,y,w,h){
   const xmin=Math.max(0,x-1), xmax=Math.min(S.W-1,x+w);
   const ymin=Math.max(0,y-1), ymax=Math.min(S.H-1,y+h);
