@@ -1,5 +1,6 @@
 // main.js — 连续建造：本地幽灵 + Supercover + 按帧批量发送 + 去重 + 失败回滚
-// 建筑无外框；石头/金子保留外框；箭头增强；扇形开关；小地图；同源 WebSocket
+// 建筑无外框；石头/金子保留外框；扇形开关；小地图离屏；同源 WebSocket
+// 性能优化：Path2D 箭头、子弹数组视图 + 降采样、装饰层自适应跳过、幽灵批量绘制
 
 // —— 画布与 UI —— //
 const canvas = document.getElementById('game');
@@ -45,7 +46,7 @@ const COLOR = {
   gridA:  '#2a2a2a',
   gridB:  '#242424',
   resStroke: '#1a1a1a', // 资源外框
-  // 阵营通用（箭头/预览/扇形/选框）
+  // 阵营通用（预览/扇形/选框）
   ally:       '#2b7bff',
   allyLight:  '#75a9ff',
   enemy:      '#ff3b3b',
@@ -80,9 +81,13 @@ const MAX_PROCESS_PER_FRAME = 400; // 每帧最大插值格数（防止卡顿）
 function deg2rad(d){ return d*Math.PI/180; }
 function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
 
+// —— 性能状态 —— //
+let _lastFrameCostMs = 0;
+let _skipDecor = false; // 跳过装饰层（箭头、扇形）以稳帧
+
 // —— 小地图 —— //
 const MINI = { size: 160, pad: 10 };
-// 离屏小地图缓存（优化）
+// 离屏小地图缓存
 let miniCanvas=null, miniCtx=null, miniDirty=true;
 
 // —— 状态 —— //
@@ -111,8 +116,8 @@ const S = {
   turrets: []
 };
 
-// —— 本地子弹（平滑） —— //
-const Local = { bullets: new Map() };
+// —— 本地子弹 —— //
+const Local = { bullets: new Map(), arr: [] }; // arr 为数组视图，用于高效绘制
 
 // —— 本地幽灵（未被服务端确认的本地回显） —— //
 const Ghost = {
@@ -302,6 +307,44 @@ function supercoverLineCells(x0,y0,x1,y1){
   return out;
 }
 
+// —— 预构建箭头 Path2D —— //
+const ARROW_PATHS = (() => {
+  const mk = (rot90) => {
+    const p = new Path2D();
+    const pts = [
+      {x:+0.5,  y:0.0},
+      {x:-0.5,  y:-0.3},
+      {x:-0.5,  y:+0.3}
+    ];
+    const sin = [0,1,0,-1][rot90], cos = [1,0,-1,0][rot90];
+    const rx = (x,y)=>({ x: x*cos - y*sin, y: x*sin + y*cos });
+    const a = rx(pts[0].x, pts[0].y);
+    const b = rx(pts[1].x, pts[1].y);
+    const c = rx(pts[2].x, pts[2].y);
+    p.moveTo(a.x, a.y); p.lineTo(b.x, b.y); p.lineTo(c.x, c.y); p.closePath();
+    return p;
+  };
+  return [mk(0), mk(1), mk(2), mk(3)];
+})();
+function drawArrowFast(cx, cy, facingDir, size, color, alpha=1){
+  const p = ARROW_PATHS[(facingDir|0)&3];
+  const s = Math.max(size, 1);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(s, s);
+  ctx.globalAlpha = alpha;
+  ctx.lineJoin = 'round'; ctx.lineCap='round';
+  ctx.strokeStyle = 'rgba(0,0,0,0.95)';
+  ctx.lineWidth = Math.max(2.2, size*0.14)/s;
+  ctx.stroke(p);
+  ctx.fillStyle = color;
+  ctx.fill(p);
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = Math.max(1.2, size*0.06)/s;
+  ctx.stroke(p);
+  ctx.restore();
+}
+
 // —— 幽灵 & 发送入队 —— //
 function enqueueGhostAndSend(type, x, y, dir){
   const fp=getFootprint(type, dir);
@@ -484,7 +527,7 @@ function reconcileGhostsWithServer(){
   }
 }
 
-// —— 子弹融合（瞬间消失） —— //
+// —— 子弹融合（瞬间消失 + 数组视图） —— //
 function reconcileBulletsFromServer(serverList){
   const seen = new Set();
   for(const sb of serverList){
@@ -505,6 +548,8 @@ function reconcileBulletsFromServer(serverList){
       Local.bullets.delete(id); // 直接移除
     }
   }
+  // 重建数组视图（成本低）
+  Local.arr = Array.from(Local.bullets.values());
 }
 
 function updateLocal(dt){
@@ -605,43 +650,63 @@ function ensureMini(){
   miniDirty = false;
 }
 
-// —— 绘制幽灵（半透明覆写，不改 BG） —— //
+// —— 幽灵绘制（批量填充 + 可选扇形/箭头预览） —— //
 function drawGhosts(){
+  // 1) 批量矩形
+  const groups = new Map(); // key: `${type}-${ally?'a':'e'}` -> {path, color, alphaSum, count}
+  const add = (k, color, x,y,w,h, alpha)=> {
+    let g = groups.get(k);
+    if(!g){
+      g = { path: new Path2D(), color, alphaSum:0, count:0 };
+      groups.set(k, g);
+    }
+    g.path.rect(x*CELL, y*CELL, w*CELL, h*CELL);
+    g.alphaSum += alpha; g.count++;
+  };
   for(const g of Ghost.items.values()){
     const ally = (g.team===S.you);
+    const key = g.type + '-' + (ally?'a':'e');
     const fill = colorForType(g.type, ally);
-    const alpha = clamp(g.alpha, 0, 0.9);
+    const alpha = clamp(g.alpha, 0, 0.9)*0.7;
     if(alpha<=0) continue;
-
+    add(key, fill, g.x,g.y,g.w,g.h, alpha);
+  }
+  for(const {path, color, alphaSum, count} of groups.values()){
     ctx.save();
-    ctx.globalAlpha = alpha*0.7;
-    ctx.fillStyle = fill;
-    ctx.fillRect(g.x*CELL, g.y*CELL, g.w*CELL, g.h*CELL);
+    ctx.globalAlpha = (count? alphaSum/count : 0.5);
+    ctx.fillStyle = color;
+    ctx.fill(path);
     ctx.restore();
+  }
 
-    // 预览扇形/箭头（仅非核心）
+  // 2) 扇形与箭头预览（数量较少；在负载高时可跳过）
+  if(_skipDecor) return;
+
+  for(const g of Ghost.items.values()){
+    const ally = (g.team===S.you);
     const arc=(g.type==='turret')?90:(g.type==='ciws')?180:(g.type==='sniper')?45:(g.type==='core')?360:0;
     const range=(g.type==='turret')?8:(g.type==='ciws')?3:(g.type==='sniper')?20:(g.type==='core')?16:0;
-    if(arc>0){
-      const cenDir = (g.type==='ciws') ? ((g.dir+1)&3) : g.dir;
-      const cx=(g.x+g.w*0.5)*CELL, cy=(g.y+g.h*0.5)*CELL;
-      const r=range*CELL;
-      ctx.save(); ctx.globalAlpha=0.16;
-      ctx.fillStyle = ally?COLOR.allyLight:COLOR.enemyLight;
-      if(arc<360){
-        const center=DIR_TO_RAD[cenDir|0];
-        ctx.beginPath();
-        const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2;
-        ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill();
-      }else{
-        ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill();
-      }
-      ctx.restore();
+    if(arc<=0) continue;
 
-      if(g.type!=='core'){
-        const color = ally?COLOR.ally:COLOR.enemy;
-        drawArrow(cx, cy, cenDir, Math.min(g.w,g.h)*CELL*0.9, color, 0.9);
-      }
+    const cenDir = (g.type==='ciws') ? ((g.dir+1)&3) : g.dir;
+    const cx=(g.x+g.w*0.5)*CELL, cy=(g.y+g.h*0.5)*CELL;
+    const r=range*CELL;
+
+    ctx.save(); ctx.globalAlpha=0.16;
+    ctx.fillStyle = ally?COLOR.allyLight:COLOR.enemyLight;
+    if(arc<360){
+      const center=DIR_TO_RAD[cenDir|0];
+      ctx.beginPath();
+      const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2;
+      ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill();
+    }else{
+      ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+
+    if(g.type!=='core'){
+      const color = ally?COLOR.ally:COLOR.enemy;
+      drawArrowFast(cx, cy, cenDir, Math.min(g.w,g.h)*CELL*0.9, color, 0.9);
     }
   }
 }
@@ -651,8 +716,8 @@ function draw(){
   ensureBG();
   ctx.drawImage(bgCanvas, 0, 0);
 
-  // 服务端扇形/核心圆
-  if(showArcs){
+  // 服务端扇形/核心圆（自适应跳过）
+  if(showArcs && !_skipDecor){
     for(const t of S.turrets){
       const r=t.rangeCells*CELL;
       const colorFill=(t.team===S.you)?COLOR.allyLight:COLOR.enemyLight;
@@ -671,32 +736,35 @@ function draw(){
     }
   }
 
-  // 炮台方向箭头（核心不画；移除阴影以提速）
-  for(const t of S.turrets){
-    if(t.role==='core') continue;
-    const color = (t.team===S.you)?COLOR.ally:COLOR.enemy;
-    drawArrow(t.cx*CELL, t.cy*CELL, t.facingDir, Math.min(t.w,t.h)*CELL*0.9, color, 0.95);
+  // 炮台方向箭头（核心不画；在高负载时跳过）
+  if(!_skipDecor){
+    for(const t of S.turrets){
+      if(t.role==='core') continue;
+      const color = (t.team===S.you)?COLOR.ally:COLOR.enemy;
+      drawArrowFast(t.cx*CELL, t.cy*CELL, t.facingDir, Math.min(t.w,t.h)*CELL*0.9, color, 0.95);
+    }
   }
 
   // 幽灵建筑（本地回显层）
   drawGhosts();
 
-  // 子弹批量绘制（减少状态切换与调用次数）
+  // 子弹批量绘制（数组视图 + 自适应降采样）
+  const n = Local.arr.length;
+  const step = (n > 1200) ? 3 : (n > 700) ? 2 : 1;
+
   ctx.fillStyle = '#ffffff';
   ctx.beginPath();
-  for (const [, b] of Local.bullets){
-    if(b.team===S.you){
-      ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
-    }
+  for (let i=0;i<n;i+=step){
+    const b = Local.arr[i];
+    if(b.team===S.you) ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
   }
   ctx.fill();
 
   ctx.fillStyle = '#ffd1d1';
   ctx.beginPath();
-  for (const [, b] of Local.bullets){
-    if(b.team!==S.you){
-      ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
-    }
+  for (let i=0;i<n;i+=step){
+    const b = Local.arr[i];
+    if(b.team!==S.you) ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
   }
   ctx.fill();
 
@@ -709,25 +777,27 @@ function draw(){
     ctx.lineWidth=1; ctx.strokeStyle=ok?COLOR.allyLight:COLOR.enemyLight;
     ctx.strokeRect(hoverX*CELL+0.5,hoverY*CELL+0.5,fp.w*CELL-1,fp.h*CELL-1);
 
-    const arc=(selectedType==='turret')?90:(selectedType==='ciws')?180:(selectedType==='sniper')?45:(selectedType==='core')?360:0;
-    const range=(selectedType==='turret')?8:(selectedType==='ciws')?3:(selectedType==='sniper')?20:(selectedType==='core')?16:0;
-    if(arc>0){
-      const cx=(hoverX+fp.w*0.5)*CELL, cy=(hoverY+fp.h*0.5)*CELL;
-      const cenDir = (selectedType==='ciws') ? ((buildFacingDir+1)&3) : buildFacingDir;
-      const center=DIR_TO_RAD[cenDir|0]; const r=range*CELL;
+    if(!_skipDecor){
+      const arc=(selectedType==='turret')?90:(selectedType==='ciws')?180:(selectedType==='sniper')?45:(selectedType==='core')?360:0;
+      const range=(selectedType==='turret')?8:(selectedType==='ciws')?3:(selectedType==='sniper')?20:(selectedType==='core')?16:0;
+      if(arc>0){
+        const cx=(hoverX+fp.w*0.5)*CELL, cy=(hoverY+fp.h*0.5)*CELL;
+        const cenDir = (selectedType==='ciws') ? ((buildFacingDir+1)&3) : buildFacingDir;
+        const center=DIR_TO_RAD[cenDir|0]; const r=range*CELL;
 
-      if(arc<360){
-        ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
-        ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2;
-        ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); ctx.restore();
-      }else{
-        ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
-        ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore();
-      }
+        if(arc<360){
+          ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+          ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2;
+          ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); ctx.restore();
+        }else{
+          ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+          ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore();
+        }
 
-      if(selectedType!=='core'){
-        const colorPreview = ok ? COLOR.ally : COLOR.enemy;
-        drawArrow(cx, cy, cenDir, Math.min(fp.w,fp.h)*CELL*0.9, colorPreview, 0.95);
+        if(selectedType!=='core'){
+          const colorPreview = ok ? COLOR.ally : COLOR.enemy;
+          drawArrowFast(cx, cy, cenDir, Math.min(fp.w,fp.h)*CELL*0.9, colorPreview, 0.95);
+        }
       }
     }
   }else if(mode==='demolish'&&selecting&&selectStart&&selectEnd){
@@ -764,41 +834,11 @@ function drawMiniMap(){
   ctx.restore();
 }
 
-// —— 箭头（增强版；去阴影以提速） —— //
-function drawArrow(cx, cy, facingDir, size, color, alpha=1){
-  size *= 1.25;
-  const base = size*0.6, height = size*0.8, halfBase = base/2;
-  const pts = [{x:+height/2,y:0},{x:-height/2,y:-halfBase},{x:-height/2,y:+halfBase}];
-  const ang = [0, Math.PI/2, Math.PI, -Math.PI/2][facingDir|0];
-
-  ctx.save();
-  ctx.translate(cx,cy);
-  ctx.rotate(ang);
-  ctx.globalAlpha = alpha;
-  ctx.lineJoin = 'round'; ctx.lineCap='round';
-
-  ctx.beginPath();
-  ctx.moveTo(pts[0].x,pts[0].y);
-  ctx.lineTo(pts[1].x,pts[1].y);
-  ctx.lineTo(pts[2].x,pts[2].y);
-  ctx.closePath();
-  ctx.strokeStyle = 'rgba(0,0,0,0.95)';
-  ctx.lineWidth = Math.max(2.2, size*0.14);
-  ctx.stroke();
-
-  ctx.fillStyle = color;
-  ctx.fill();
-
-  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
-  ctx.lineWidth = Math.max(1.2, size*0.06);
-  ctx.stroke();
-
-  ctx.restore();
-}
-
 // —— 帧循环 —— //
 let _rafLast = performance.now();
 function loop(ts){
+  const t0 = performance.now();
+
   const dt = Math.min(0.05, (ts - _rafLast)/1000);
   _rafLast = ts;
 
@@ -808,6 +848,11 @@ function loop(ts){
 
   updateLocal(dt);
   draw();
+
+  const used = performance.now() - t0;
+  _lastFrameCostMs = used;
+  _skipDecor = used > 18; // >18ms：下一帧跳过装饰层以稳帧
+
   requestAnimationFrame(loop);
 }
 
@@ -850,7 +895,6 @@ initAll();
   mo.observe(document.documentElement, { childList: true, subtree: true });
   window.__reserveFixedBars = reserveSpaceForFixedBars;
 })();
-
 
 // —— Net 传输层（若页面中已存在 Net 则不覆盖；使用同源 WS_URL） —— //
 (function(){
