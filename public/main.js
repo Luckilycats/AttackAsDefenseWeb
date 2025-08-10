@@ -1,7 +1,7 @@
 // main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色 + 刷新投票
 // 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
 // 性能：Path2D 箭头、子弹批量绘制、装饰层自适应跳过；子弹瞬间消失
-// 已移除音效功能
+// 已移除小地图与全部音效
 
 /* ====================== 画布与 UI ====================== */
 const canvas = document.getElementById('game');
@@ -148,7 +148,6 @@ function setRefreshPending(pending, deadline){
     btnRefresh.disabled = pending;
     btnRefresh.textContent = pending ? '等待同意…' : '刷新地图';
   }
-  // 倒计时提示（观感），可选
   if(refreshTicker){ clearInterval(refreshTicker); refreshTicker=null; }
   if(pending && deadline){
     refreshTicker = setInterval(()=>{
@@ -451,7 +450,6 @@ function connectOnlineAuto(){
   Net.onRefreshResult = (m)=>{
     setRefreshPending(false, 0);
     if(m.ok){
-      // 清理本地瞬态
       Local.bullets.clear(); Local.arr=[];
       Ghost.items.clear(); Ghost.pendingSet.clear(); Ghost.queue.length=0; Ghost.cellQueue.length=0;
       bgDirty=true;
