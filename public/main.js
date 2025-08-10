@@ -1,4 +1,4 @@
-// main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数显示
+// main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色显示
 // 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
 // 性能：Path2D 箭头、子弹批量绘制、装饰层自适应跳过；子弹瞬间消失
 // 已移除音效功能
@@ -35,13 +35,27 @@ const COLOR = {
   enemy:'#ff3b3b', enemyLight:'#ff8a8a'
 };
 
-/* ===== 顶部身份与人数标签 ===== */
+/* ===== 顶部身份/人数/阵营颜色标签 ===== */
 const youEl = document.createElement('span');
 youEl.id='you-label'; youEl.style.marginLeft='12px';
+
 const roomEl = document.createElement('span');
 roomEl.id='room-label'; roomEl.style.marginLeft='12px';
-document.getElementById('topbar')?.appendChild(youEl);
-document.getElementById('topbar')?.appendChild(roomEl);
+
+const teamEl = document.createElement('span');
+teamEl.id='team-label';
+teamEl.style.marginLeft = '12px';
+teamEl.style.padding = '2px 6px';
+teamEl.style.borderRadius = '6px';
+teamEl.style.border = '1px solid #666';
+teamEl.style.background = '#1f1f1f';
+teamEl.style.color = '#eaeaea';
+teamEl.textContent = '';
+
+const topbar = document.getElementById('topbar');
+topbar?.appendChild(youEl);
+topbar?.appendChild(roomEl);
+topbar?.appendChild(teamEl);
 
 /* ===== 攻击范围开关按钮 ===== */
 const btnToggleArcs = document.createElement('button');
@@ -108,8 +122,26 @@ btnToggleArcs.onclick = ()=>{
 };
 function labelOf(t){ return t==='road'?'道路':t==='wall'?'围墙':t==='turret'?'基础炮':t==='ciws'?'近防炮':t==='sniper'?'狙击炮':''; }
 function updateHUD(){
-  if(ROLE==='player'){ goldEl.textContent=S.gold[S.you]||0; youEl.textContent=S.you?`你是：P${S.you}`:''; }
-  else{ goldEl.textContent='—'; youEl.textContent='观战中'; }
+  if(ROLE==='player'){
+    goldEl.textContent=S.gold[S.you]||0;
+    youEl.textContent=S.you?`你是：P${S.you}`:'';
+    // 阵营颜色：P1=蓝；P2=红
+    if (S.you===1){
+      teamEl.textContent = '阵营颜色：蓝';
+      teamEl.style.borderColor = COLOR.ally;
+      teamEl.style.color = '#eaeaea';
+    }else if(S.you===2){
+      teamEl.textContent = '阵营颜色：红';
+      teamEl.style.borderColor = COLOR.enemy;
+      teamEl.style.color = '#eaeaea';
+    }else{
+      teamEl.textContent = '';
+    }
+  }else{
+    goldEl.textContent='—';
+    youEl.textContent='观战中';
+    teamEl.textContent = '';
+  }
 }
 function updateRoomLabel(playerCount=0, spectatorCount=0){
   roomEl.textContent = `玩家：${playerCount}/2 | 观战：${spectatorCount}`;
@@ -203,14 +235,20 @@ function colorForTypeByTeam(type, team){
 function inBounds(x,y){ return x>=0&&y>=0&&x<S.W&&y<S.H; }
 function rectInBounds(x,y,w,h){ return x>=0&&y>=0&&(x+w)<=S.W&&(y+h)<=S.H; }
 function areaEmptyClient(x,y,w,h){ for(let j=0;j<h;j++)for(let i=0;i<w;i++){ if(S.map[(y+j)*S.W+(x+i)]!==0) return false; } return true; }
+
+/* 仅允许在“己方建筑相邻”处建造（四周一圈含对角），与服务端一致 */
 function rectCanBuildHereClient(x,y,w,h){
   const xmin=Math.max(0,x-1), xmax=Math.min(S.W-1,x+w);
   const ymin=Math.max(0,y-1), ymax=Math.min(S.H-1,y+h);
   for(let yy=ymin;yy<=ymax;yy++){
     for(let xx=xmin;xx<=xmax;xx++){
-      const onPerimeter=(xx<x||xx>=x+w||yy<y||yy>=y+h); if(!onPerimeter) continue;
-      const i=yy*S.W+xx, v=S.map[i];
-      if(v===3||v===4||v===10||v===11||v===12||v===13||v===14) return true;
+      const onPerimeter=(xx<x||xx>=x+w||yy<y||yy>=y+h);
+      if(!onPerimeter) continue;
+      const i=yy*S.W+xx;
+      const v=S.map[i];
+      const o=S.owner[i];
+      const isBuilding = (v===3||v===4||v===10||v===11||v===12||v===13||v===14);
+      if(isBuilding && o===S.you) return true;   // 关键：必须相邻己方建筑
     }
   }
   return false;
@@ -475,7 +513,9 @@ function draw(){
 
   if(ROLE==='player'&&mode==='build'&&selectedType&&hoverX>=0&&hoverY>=0){
     const fp=getFootprint(selectedType,buildFacingDir);
-    const ok=rectInBounds(hoverX,hoverY,fp.w,fp.h)&&areaEmptyClient(hoverX,hoverY,fp.w,fp.h)&&rectCanBuildHereClient(hoverX,hoverY,fp.w,fp.h);
+    const ok=rectInBounds(hoverX,hoverY,fp.w,fp.h)
+           && areaEmptyClient(hoverX,hoverY,fp.w,fp.h)
+           && rectCanBuildHereClient(hoverX,hoverY,fp.w,fp.h);
     ctx.globalAlpha=0.35; ctx.fillStyle= ok?COLOR.ally:COLOR.enemy; ctx.fillRect(hoverX*CELL,hoverY*CELL,fp.w*CELL,fp.h*CELL); ctx.globalAlpha=1;
     ctx.lineWidth=1; ctx.strokeStyle=ok?COLOR.allyLight:COLOR.enemyLight; ctx.strokeRect(hoverX*CELL+0.5,hoverY*CELL+0.5,fp.w*CELL-1,fp.h*CELL-1);
 
