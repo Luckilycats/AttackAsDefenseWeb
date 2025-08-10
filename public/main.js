@@ -34,7 +34,7 @@ const COLOR = {
   enemy:'#ff3b3b', enemyLight:'#ff8a8a'
 };
 
-/* ===== 顶部身份与人数标签（由脚本注入到 topbar） ===== */
+/* ===== 顶部身份与人数标签 ===== */
 const youEl = document.createElement('span');
 youEl.id='you-label'; youEl.style.marginLeft='12px';
 const roomEl = document.createElement('span');
@@ -169,7 +169,7 @@ function initUI(){
     else if(e.key==='Escape'||e.key==='Esc') enterBrowseMode();
   });
 
-  if(ROLE==='spectator'){ [...buildButtons, btnDemo, btnCancel].forEach(b=> b.setAttribute('disabled','disabled')); }
+  // 不在此处根据 ROLE 禁用按钮，等待 Net.onStart 后处理
 }
 
 /* ====================== 坐标/取色/校验 ====================== */
@@ -345,7 +345,15 @@ function connectOnlineAuto(){
     S.W=m.W; S.H=m.H;
     canvas.width=S.W*CELL; canvas.height=S.H*CELL;
     bgDirty=true; updateHUD();
-    if(ROLE==='spectator'){ [...buildButtons, btnDemo, btnCancel].forEach(b=> b.setAttribute('disabled','disabled')); }
+
+    // 按身份启用/禁用控件；观战强制回浏览模式
+    const controls = [...buildButtons, btnDemo, btnCancel];
+    if (ROLE === 'spectator') {
+      controls.forEach(b => b.setAttribute('disabled','disabled'));
+      enterBrowseMode();
+    } else {
+      controls.forEach(b => b.removeAttribute('disabled'));
+    }
   };
   Net.onState = (m)=>{
     const had=Local.bullets.size;
