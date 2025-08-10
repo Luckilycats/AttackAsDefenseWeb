@@ -1,12 +1,10 @@
 // main.js — 单房间 GLOBAL：自动联机 + 玩家/观战分配 + 顶部人数与阵营颜色 + 刷新投票
-// 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
-// 性能：Path2D 箭头、子弹批量绘制、装饰层自适应跳过；子弹瞬间消失
-// 音效与小地图已移除
-// 本次同步：建造预览与幽灵扇形范围与服务端一致（turret=16, ciws=6, sniper=40, core=16）
+// 绘制优化：更激进抽样与装饰层跳过；子弹瞬间消失；BG 仅脏时重绘
+// 注意：协议不变
 
 /* ====================== 画布与 UI ====================== */
 const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
+const ctx = canvas.getContext('2d', { alpha: true });
 
 const btnRoad    = document.getElementById('btn-road');
 const btnWall    = document.getElementById('btn-wall');
@@ -236,7 +234,8 @@ function initUI(){
 }
 
 /* ====================== 坐标/取色/校验 ====================== */
-function pointerToCell(e){ const r=canvas.getBoundingClientRect(); const px=e.clientX-r.left, py=e.clientY-r.top; return {px,py,mx:Math.floor(px/CELL),my:Math.floor(py/CELL)}; }
+const CELL_F = CELL; // 常量别名，便于 JIT
+function pointerToCell(e){ const r=canvas.getBoundingClientRect(); const px=e.clientX-r.left, py=e.clientY-r.top; return {px,py,mx:Math.floor(px/CELL_F),my:Math.floor(py/CELL_F)}; }
 function getFootprint(type, dir){
   if(type==='turret') return {w:2,h:2};
   if(type==='ciws')   return (dir===0||dir===2)?{w:3,h:2}:{w:2,h:3};
@@ -427,6 +426,7 @@ function connectOnlineAuto(){
     }
   };
   Net.onState = (m)=>{
+    // S.hp 在前端不参与绘制与判定，但沿用协议
     S.gold=m.gold; S.core=m.core;
     S.map=new Uint8Array(m.map); S.hp=new Uint16Array(m.hp); S.owner=new Uint8Array(m.owner);
     S.turrets=m.turrets; bgDirty=true;
@@ -485,7 +485,7 @@ function reconcileGhostsWithServer(){
   }
 }
 
-/* ====================== 子弹融合（瞬间消失） ====================== */
+/* ====================== 子弹融合（瞬间消失 + 更激进抽样） ====================== */
 function reconcileBulletsFromServer(list){
   const seen=new Set();
   for(const sb of list){
@@ -498,6 +498,7 @@ function reconcileBulletsFromServer(list){
     }
   }
   for(const [id] of Local.bullets){ if(!seen.has(id)) Local.bullets.delete(id); }
+  // 构建线性数组供批量绘制
   Local.arr = Array.from(Local.bullets.values());
 }
 function updateLocal(dt){
@@ -515,13 +516,13 @@ function ensureBG(){
     bgCanvas=document.createElement('canvas'); bgCanvas.width=canvas.width; bgCanvas.height=canvas.height; bgCtx=bgCanvas.getContext('2d'); bgDirty=true;
   }
   if(!bgDirty) return;
-  const W=S.W,H=S.H;
-  for(let y=0;y<H;y++) for(let x=0;x<W;x++){ bgCtx.fillStyle=((x+y)&1)?COLOR.gridA:COLOR.gridB; bgCtx.fillRect(x*CELL,y*CELL,CELL,CELL); }
+  const W=S.W,H=S.H, cell=CELL_F;
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){ bgCtx.fillStyle=((x+y)&1)?COLOR.gridA:COLOR.gridB; bgCtx.fillRect(x*cell,y*cell,cell,cell); }
   for(let y=0;y<H;y++) for(let x=0;x<W;x++){
     const idx=y*W+x, v=S.map[idx]; if(!v) continue;
     const o=S.owner[idx], fill=colorForCell(v,o); if(!fill) continue;
-    bgCtx.fillStyle=fill; bgCtx.fillRect(x*CELL,y*CELL,CELL,CELL);
-    if(v===1||v===2){ bgCtx.lineWidth=0.75; bgCtx.strokeStyle=COLOR.resStroke; bgCtx.strokeRect(x*CELL+0.35,y*CELL+0.35,CELL-0.7,CELL-0.7); }
+    bgCtx.fillStyle=fill; bgCtx.fillRect(x*cell,y*cell,cell,cell);
+    if(v===1||v===2){ bgCtx.lineWidth=0.75; bgCtx.strokeStyle=COLOR.resStroke; bgCtx.strokeRect(x*cell+0.35,y*cell+0.35,cell-0.7,cell-0.7); }
   }
   bgDirty=false;
 }
@@ -529,7 +530,7 @@ function ensureBG(){
 /* ====================== 幽灵与主绘制 ====================== */
 function drawGhosts(){
   const groups=new Map();
-  const add=(k,color,x,y,w,h,a)=>{ let g=groups.get(k); if(!g){ g={path:new Path2D(),color,alphaSum:0,count:0}; groups.set(k,g);} g.path.rect(x*CELL,y*CELL,w*CELL,h*CELL); g.alphaSum+=a; g.count++; };
+  const add=(k,color,x,y,w,h,a)=>{ let g=groups.get(k); if(!g){ g={path:new Path2D(),color,alphaSum:0,count:0}; groups.set(k,g);} g.path.rect(x*CELL_F,y*CELL_F,w*CELL_F,h*CELL_F); g.alphaSum+=a; g.count++; };
   for(const g of Ghost.items.values()){
     const fill=colorForTypeByTeam(g.type,g.team||1);
     const alpha=clamp(g.alpha,0,0.9)*0.7; if(alpha<=0) continue;
@@ -541,16 +542,16 @@ function drawGhosts(){
   if(_skipDecor) return;
   for(const g of Ghost.items.values()){
     const arc=(g.type==='turret')?90:(g.type==='ciws')?180:(g.type==='sniper')?45:(g.type==='core')?360:0;
-    // 同步：turret=16, ciws=6, sniper=40, core=16
+    // 与服务器一致：turret=16, ciws=6, sniper=40, core=16
     const range=(g.type==='turret')?16:(g.type==='ciws')?6:(g.type==='sniper')?40:(g.type==='core')?16:0;
     if(arc>0){
       const cenDir=(g.type==='ciws')?((g.dir+1)&3):g.dir;
-      const cx=(g.x+g.w*0.5)*CELL, cy=(g.y+g.h*0.5)*CELL, r=range*CELL;
+      const cx=(g.x+g.w*0.5)*CELL_F, cy=(g.y+g.h*0.5)*CELL_F, r=range*CELL_F;
       ctx.save(); ctx.globalAlpha=0.16; ctx.fillStyle=(g.team===1)?COLOR.allyLight:COLOR.enemyLight;
       if(arc<360){ const center=DIR_TO_RAD[cenDir|0]; ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2; ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); }
       else{ ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); }
       ctx.restore();
-      if(g.type!=='core'){ drawArrowFast(cx,cy,cenDir,Math.min(g.w,g.h)*CELL*0.9,(g.team===1)?COLOR.ally:COLOR.enemy,0.9); }
+      if(g.type!=='core'){ drawArrowFast(cx,cy,cenDir,Math.min(g.w,g.h)*CELL_F*0.9,(g.team===1)?COLOR.ally:COLOR.enemy,0.9); }
     }
   }
 }
@@ -559,49 +560,49 @@ function draw(){
 
   if(showArcs && !_skipDecor){
     for(const t of S.turrets){
-      const r=t.rangeCells*CELL, colorFill=(t.team===1)?COLOR.allyLight:COLOR.enemyLight;
-      if(t.arcDeg<360){ const center=DIR_TO_RAD[t.facingDir|0]; ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill;
-        ctx.beginPath(); const a0=center-deg2rad(t.arcDeg)/2, a1=center+deg2rad(t.arcDeg)/2; ctx.moveTo(t.cx*CELL,t.cy*CELL); ctx.arc(t.cx*CELL,t.cy*CELL,r,a0,a1);
+      const r=t.rangeCells*CELL_F, colorFill=(t.team===1)?COLOR.allyLight:COLOR.enemyLight;
+      if(t.arcDeg<360){ const center=DIR_TO_RAD[t.facingDir|0]; ctx.save(); ctx.globalAlpha=0.12; ctx.fillStyle=colorFill;
+        ctx.beginPath(); const a0=center-deg2rad(t.arcDeg)/2, a1=center+deg2rad(t.arcDeg)/2; ctx.moveTo(t.cx*CELL_F,t.cy*CELL_F); ctx.arc(t.cx*CELL_F,t.cy*CELL_F,r,a0,a1);
         ctx.closePath(); ctx.fill(); ctx.restore(); }
-      else{ ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill; ctx.beginPath(); ctx.arc(t.cx*CELL,t.cy*CELL,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore(); }
+      else{ ctx.save(); ctx.globalAlpha=0.12; ctx.fillStyle=colorFill; ctx.beginPath(); ctx.arc(t.cx*CELL_F,t.cy*CELL_F,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore(); }
     }
   }
   if(!_skipDecor){
-    for(const t of S.turrets){ if(t.role==='core') continue; const color=(t.team===1)?COLOR.ally:COLOR.enemy; drawArrowFast(t.cx*CELL,t.cy*CELL,t.facingDir,Math.min(t.w,t.h)*CELL*0.9,color,0.95); }
+    for(const t of S.turrets){ if(t.role==='core') continue; const color=(t.team===1)?COLOR.ally:COLOR.enemy; drawArrowFast(t.cx*CELL_F,t.cy*CELL_F,t.facingDir,Math.min(t.w,t.h)*CELL_F*0.9,color,0.9); }
   }
 
   // 幽灵
   drawGhosts();
 
-  // 子弹批量绘制
-  const n=Local.arr.length; const step=(n>1200)?3:(n>700)?2:1;
-  ctx.fillStyle='#ffffff'; ctx.beginPath(); for(let i=0;i<n;i+=step){ const b=Local.arr[i]; if(b.team===1) ctx.rect(b.x*CELL-2,b.y*CELL-2,4,4); } ctx.fill();
-  ctx.fillStyle='#ffd1d1'; ctx.beginPath(); for(let i=0;i<n;i+=step){ const b=Local.arr[i]; if(b.team===2) ctx.rect(b.x*CELL-2,b.y*CELL-2,4,4); } ctx.fill();
+  // 子弹批量绘制（更激进抽样）
+  const arr=Local.arr, n=arr.length;
+  const step = (n>1600)?4:(n>1000)?3:(n>600)?2:1;
+  ctx.fillStyle='#ffffff'; ctx.beginPath(); for(let i=0;i<n;i+=step){ const b=arr[i]; if(b.team===1) ctx.rect(b.x*CELL_F-2,b.y*CELL_F-2,4,4); } ctx.fill();
+  ctx.fillStyle='#ffd1d1'; ctx.beginPath(); for(let i=0;i<n;i+=step){ const b=arr[i]; if(b.team===2) ctx.rect(b.x*CELL_F-2,b.y*CELL_F-2,4,4); } ctx.fill();
 
   if(ROLE==='player'&&mode==='build'&&selectedType&&hoverX>=0&&hoverY>=0){
     const fp=getFootprint(selectedType,buildFacingDir);
     const ok=rectInBounds(hoverX,hoverY,fp.w,fp.h)
            && areaEmptyClient(hoverX,hoverY,fp.w,fp.h)
            && rectCanBuildHereClient(hoverX,hoverY,fp.w,fp.h);
-    ctx.globalAlpha=0.35; ctx.fillStyle= ok?COLOR.ally:COLOR.enemy; ctx.fillRect(hoverX*CELL,hoverY*CELL,fp.w*CELL,fp.h*CELL); ctx.globalAlpha=1;
-    ctx.lineWidth=1; ctx.strokeStyle=ok?COLOR.allyLight:COLOR.enemyLight; ctx.strokeRect(hoverX*CELL+0.5,hoverY*CELL+0.5,fp.w*CELL-1,fp.h*CELL-1);
+    ctx.globalAlpha=0.33; ctx.fillStyle= ok?COLOR.ally:COLOR.enemy; ctx.fillRect(hoverX*CELL_F,hoverY*CELL_F,fp.w*CELL_F,fp.h*CELL_F); ctx.globalAlpha=1;
+    ctx.lineWidth=1; ctx.strokeStyle=ok?COLOR.allyLight:COLOR.enemyLight; ctx.strokeRect(hoverX*CELL_F+0.5,hoverY*CELL_F+0.5,fp.w*CELL_F-1,fp.h*CELL_F-1);
 
     if(!_skipDecor){
       const arc=(selectedType==='turret')?90:(selectedType==='ciws')?180:(selectedType==='sniper')?45:(selectedType==='core')?360:0;
-      // 同步：turret=16, ciws=6, sniper=40, core=16
       const range=(selectedType==='turret')?16:(selectedType==='ciws')?6:(selectedType==='sniper')?40:(selectedType==='core')?16:0;
       if(arc>0){
-        const cx=(hoverX+fp.w*0.5)*CELL, cy=(hoverY+fp.h*0.5)*CELL;
+        const cx=(hoverX+fp.w*0.5)*CELL_F, cy=(hoverY+fp.h*0.5)*CELL_F;
         const cenDir=(selectedType==='ciws')?((buildFacingDir+1)&3):buildFacingDir;
-        const center=DIR_TO_RAD[cenDir|0], r=range*CELL;
-        if(arc<360){ ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy; ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2; ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); ctx.restore(); }
-        else{ ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore(); }
-        if(selectedType!=='core'){ drawArrowFast(cx,cy,cenDir,Math.min(fp.w,fp.h)*CELL*0.9,COLOR.ally,0.95); }
+        const center=DIR_TO_RAD[cenDir|0], r=range*CELL_F;
+        if(arc<360){ ctx.save(); ctx.globalAlpha=0.20; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy; ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2; ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); ctx.restore(); }
+        else{ ctx.save(); ctx.globalAlpha=0.20; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore(); }
+        if(selectedType!=='core'){ drawArrowFast(cx,cy,cenDir,Math.min(fp.w,fp.h)*CELL_F*0.9,COLOR.ally,0.9); }
       }
     }
   }else if(ROLE==='player'&&mode==='demolish'&&selecting&&selectStart&&selectEnd){
-    const x0=Math.min(selectStart.x,selectEnd.x)*CELL, x1=(Math.max(selectStart.x,selectEnd.x)+1)*CELL;
-    const y0=Math.min(selectStart.y,selectEnd.y)*CELL, y1=(Math.max(selectStart.y,selectEnd.y)+1)*CELL;
+    const x0=Math.min(selectStart.x,selectEnd.x)*CELL_F, x1=(Math.max(selectStart.x,selectEnd.x)+1)*CELL_F;
+    const y0=Math.min(selectStart.y,selectEnd.y)*CELL_F, y1=(Math.max(selectStart.y,selectEnd.y)+1)*CELL_F;
     const w=x1-x0, h=y1-y0; ctx.globalAlpha=0.25; ctx.fillStyle=COLOR.enemy; ctx.fillRect(x0,y0,w,h); ctx.globalAlpha=1;
     ctx.lineWidth=2; ctx.setLineDash([6,4]); ctx.strokeStyle=COLOR.enemyLight; ctx.strokeRect(x0+1,y0+1,w-2,h-2); ctx.setLineDash([]);
   }
@@ -613,12 +614,14 @@ function loop(ts){
   const t0=performance.now();
   const dt=Math.min(0.05,(ts-_rafLast)/1000); _rafLast=ts;
   consumeCellQueue(); flushBuildQueue(); updateLocal(dt); draw();
-  const used=performance.now()-t0; _lastFrameCostMs=used; _skipDecor = used>18;
+  const used=performance.now()-t0; _lastFrameCostMs=used; _skipDecor = used>14; // 更激进：>14ms 即跳过装饰
   requestAnimationFrame(loop);
 }
 
 /* ====================== 启动 ====================== */
 function initAll(){
+  // 降低抗锯齿成本
+  ctx.imageSmoothingEnabled = false;
   initUI(); initPointer(); updateHUD();
   window.addEventListener('load', () => setTimeout(connectOnlineAuto, 0));
   requestAnimationFrame(loop);

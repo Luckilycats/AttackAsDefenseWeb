@@ -1,6 +1,5 @@
 // server.js — 单房间：静态托管 + 同端口 WebSocket + 地图生成 + 对战逻辑 + 刷新投票
-// 消息：join / start / room / state / ended
-// 刷新投票：refresh_request / refresh_prompt / refresh_status / refresh_vote / refresh_result
+// 广播节流：逻辑 20fps，状态广播 5fps；事件仍即时广播
 // 子弹碰撞：DDA 逐格扫描，阻挡石头/金子/敌方建筑
 
 const path = require('path');
@@ -17,7 +16,8 @@ const wss = new WebSocket.Server({ server });
 
 /* -------------------- 常量与工具 -------------------- */
 const W = 100, H = 100;             // 地图尺寸
-const TICK_MS = 50;                 // 服务器帧率 20fps
+const TICK_MS = 50;                 // 逻辑帧率 20fps
+const BROADCAST_MS = 200;           // 状态广播 5fps（节流）
 const START_GOLD = 5000;            // 初始金币
 const VOTE_MS = 20000;              // 刷新投票超时 20s
 
@@ -57,7 +57,8 @@ function newRoom(){
     bullets: [],                    // {id,x,y,vx,vy,team,life}
     bulletSeq: 1,
     pendingRefresh: null,           // {initiator:1|2, deadline:number}
-    timer: null
+    timer: null,
+    _lastBroadcast: 0               // 广播节流
   };
   genMap(room);
   return room;
@@ -89,7 +90,7 @@ function placeCore(room, team, cx, cy){
     cx: cx+0.0, cy: cy+0.0,
     facingDir: 0,
     arcDeg: 360,
-    rangeCells: 16,      // 不变
+    rangeCells: 16,
     fireRate: 2,
     bulletHP: 100,
     bulletSpeed: 24,
@@ -109,24 +110,24 @@ function genMap(room){
       }
     }
   }
-  // 金子：低频聚类（仅降低概率）
+  // 金子：低频聚类（概率下调）
   const clusters = 32;
   for(let k=0;k<clusters;k++){
     const cx = 4+Math.floor(Math.random()*(W-8));
     const cy = 4+Math.floor(Math.random()*(H-8));
-    const r  = 3+Math.floor(Math.random()*3); // 3~5
+    const r  = 3+Math.floor(Math.random()*3);
     for(let y=cy-r;y<=cy+r;y++){
       for(let x=cx-r;x<=cx+r;x++){
         if(x<0||y<0||x>=W||y>=H) continue;
         const d2=(x-cx)*(x-cx)+(y-cy)*(y-cy);
-        if(d2<=r*r && Math.random()<0.25){ // 从 0.55 下调为 0.25
+        if(d2<=r*r && Math.random()<0.25){
           setCell(room,x,y,ID_GOLD,HP[ID_GOLD],0);
         }
       }
     }
   }
 
-  // 核心放置（保持原逻辑）
+  // 核心放置
   const valid = (cx,cy)=> cx>=2 && cy>=2 && cx<=W-3 && cy<=H-3;
   let p1=null, p2=null, tries=0;
   while(tries++<500){
@@ -190,21 +191,21 @@ function addTurret(room, kind, team, x,y,dir){
   const cx = x + fp.w/2, cy = y + fp.h/2;
   if(kind==='turret'){
     room.turrets.push({ id:'t'+Date.now()+Math.random(), role:'turret', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:90, rangeCells:16, fireRate:1, bulletHP:50, bulletSpeed:22, scatterDeg:2, cd:0 }); // 8→16
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:90, rangeCells:16, fireRate:1, bulletHP:50, bulletSpeed:22, scatterDeg:2, cd:0 });
   }else if(kind==='ciws'){
     const cenDir = (dir+1)&3;
     room.turrets.push({ id:'c'+Date.now()+Math.random(), role:'ciws', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:cenDir, arcDeg:180, rangeCells:6, fireRate:10, bulletHP:50, bulletSpeed:28, scatterDeg:1, cd:0 }); // 3→6
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:cenDir, arcDeg:180, rangeCells:6, fireRate:10, bulletHP:50, bulletSpeed:28, scatterDeg:1, cd:0 });
   }else if(kind==='sniper'){
     room.turrets.push({ id:'s'+Date.now()+Math.random(), role:'sniper', team,
-      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:45, rangeCells:40, fireRate:0.2, bulletHP:500, bulletSpeed:36, scatterDeg:0, cd:0 }); // 20→40
+      x,y,w:fp.w,h:fp.h, cx,cy, facingDir:dir, arcDeg:45, rangeCells:40, fireRate:0.2, bulletHP:500, bulletSpeed:36, scatterDeg:0, cd:0 });
   }
 }
 
 function buildAt(room, team, kind, x,y,dir){
   const fp = footprint(kind,dir);
   if(!rectEmpty(room,x,y,fp.w,fp.h)) return false;
-  if(!rectAdjToOwn(room,team,x,y,fp.w,fp.h)) return false; // 仅己方邻接建造
+  if(!rectAdjToOwn(room,team,x,y,fp.w,fp.h)) return false;
 
   const cost = COST[kind]||0;
   if(!spend(room,team,cost)) return false;
@@ -394,16 +395,25 @@ function stepBullets(room, dt){
 function startGame(room){
   if(room.timer) return;
   room.started = true;
+  room._lastBroadcast = 0;
   room.timer = setInterval(()=>{
+    const now = Date.now();
+
+    // 逻辑
     stepTurrets(room, TICK_MS/1000);
     stepBullets(room, TICK_MS/1000);
-    if(room.pendingRefresh && Date.now()>room.pendingRefresh.deadline){
+    if(room.pendingRefresh && now>room.pendingRefresh.deadline){
       const from = room.pendingRefresh.initiator;
       room.pendingRefresh = null;
       broadcast(room, {type:'refresh_result', ok:false, reason:'timeout', from});
     }
     checkWin(room);
-    broadcastState(room);
+
+    // 广播节流
+    if (now - room._lastBroadcast >= BROADCAST_MS) {
+      room._lastBroadcast = now;
+      broadcastState(room);
+    }
   }, TICK_MS);
 }
 function stopGame(room){
@@ -440,6 +450,15 @@ function broadcast(room, msg){
   }
 }
 function statePayload(room){
+  // 压缩子弹数值精度，减少 JSON 体积
+  const bullets = room.bullets.map(b=>({
+    id:b.id,
+    x:+b.x.toFixed(3),
+    y:+b.y.toFixed(3),
+    vx:+b.vx.toFixed(3),
+    vy:+b.vy.toFixed(3),
+    team:b.team
+  }));
   return {
     type:'state',
     W:room.W, H:room.H,
@@ -452,7 +471,7 @@ function statePayload(room){
       role: t.role, team:t.team, x:t.x,y:t.y,w:t.w,h:t.h, cx:t.cx,cy:t.cy,
       facingDir:t.facingDir, arcDeg:t.arcDeg, rangeCells:t.rangeCells
     })),
-    bullets: room.bullets.map(b=>({id:b.id,x:b.x,y:b.y,vx:b.vx,vy:b.vy,team:b.team}))
+    bullets
   };
 }
 function broadcastState(room){
@@ -472,6 +491,7 @@ function resetRoom(room){
   room.bullets = [];
   room.bulletSeq = 1;
   genMap(room);
+  broadcastState(room); // 立即一次，避免等节流
 }
 function handleRefreshRequest(ws){
   if(ws.__role!=='player' || !ws.__pid) return;
@@ -500,7 +520,6 @@ function handleRefreshVote(ws, accept){
     room.pendingRefresh = null;
     resetRoom(room);
     broadcast(room, {type:'refresh_result', ok:true});
-    broadcastState(room);
   }else{
     const from = pr.initiator;
     room.pendingRefresh = null;
@@ -538,7 +557,7 @@ wss.on('connection', (ws)=>{
     if(m.type==='build' && ws.__role==='player'){
       const {kind,x,y,dir} = m;
       if(buildAt(room, ws.__pid, kind, x|0, y|0, (dir|0)&3)){
-        broadcastState(room);
+        broadcastState(room); // 事件即时广播一次
       }
       return;
     }
@@ -546,7 +565,7 @@ wss.on('connection', (ws)=>{
     if(m.type==='demolish' && ws.__role==='player'){
       const {x0,y0,x1,y1} = m;
       demolishRect(room, ws.__pid, x0|0,y0|0,x1|0,y1|0);
-      broadcastState(room);
+      broadcastState(room); // 事件即时广播一次
       return;
     }
 
