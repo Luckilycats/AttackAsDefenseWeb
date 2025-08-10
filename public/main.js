@@ -71,7 +71,7 @@ document.getElementById('topbar')?.appendChild(youEl);
 // —— 常量 —— //
 const CELL=8;
 const DIR_TO_RAD = [0, Math.PI/2, Math.PI, -Math.PI/2];
-const FADE_T = 0.25;               // 子弹淡出
+const FADE_T = 0.25;               // 子弹淡出（已不再使用）
 const GHOST_FADE_T = 0.25;         // 幽灵回滚淡出
 const GHOST_TIMEOUT = 1.0;         // 超时未被服务器采纳则回滚
 const MAX_SEND_PER_FRAME = 160;    // 每帧最大发送建造数
@@ -480,32 +480,35 @@ function reconcileGhostsWithServer(){
   }
 }
 
-// —— 子弹融合 —— //
+// —— 子弹融合（瞬间消失） —— //
 function reconcileBulletsFromServer(serverList){
   const seen = new Set();
   for(const sb of serverList){
     seen.add(sb.id);
     const lb = Local.bullets.get(sb.id);
     if(!lb){
-      Local.bullets.set(sb.id, { x:sb.x, y:sb.y, vx:sb.vx, vy:sb.vy, team:sb.team, fade:sb.fade||0, dead:false });
+      Local.bullets.set(sb.id, { x:sb.x, y:sb.y, vx:sb.vx, vy:sb.vy, team:sb.team, dead:false });
     }else{
       const blend = 0.2;
       lb.x += (sb.x - lb.x) * blend;
       lb.y += (sb.y - lb.y) * blend;
       lb.vx = sb.vx; lb.vy = sb.vy; lb.team = sb.team;
-      lb.fade = sb.fade||0; lb.dead=false;
+      lb.dead=false;
     }
   }
   for(const [id, lb] of Local.bullets){
-    if(!seen.has(id) && !lb.dead){
-      lb.dead = true;
-      if(lb.fade<=0) lb.fade = FADE_T;
+    if(!seen.has(id)){
+      Local.bullets.delete(id); // 直接移除
     }
   }
 }
+
 function updateLocal(dt){
   for(const [id, b] of Local.bullets){
-    if(b.fade>0){ b.fade -= dt; if(b.fade<=0){ Local.bullets.delete(id); continue; } }
+    if(b.dead){ 
+      Local.bullets.delete(id);
+      continue;
+    }
     b.x += b.vx * dt;
     b.y += b.vy * dt;
   }
@@ -631,13 +634,10 @@ function draw(){
   // 幽灵建筑（本地回显层）
   drawGhosts();
 
-  // 子弹
+  // 子弹（不再按透明度淡化，直接绘制）
   for(const [_, b] of Local.bullets){
-    const alpha = (b.fade>0) ? clamp(b.fade/FADE_T, 0, 1) : 1;
-    ctx.globalAlpha = alpha;
     ctx.fillStyle = (b.team===S.you)?'#ffffff':'#ffd1d1';
     ctx.fillRect(b.x*CELL-2, b.y*CELL-2, 4,4);
-    ctx.globalAlpha = 1;
   }
 
   // 建造预览框
