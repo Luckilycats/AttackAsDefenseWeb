@@ -1,0 +1,15 @@
+{
+  "name": "attack-as-defense-web",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.15.1"
+  }
+}

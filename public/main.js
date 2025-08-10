@@ -1,0 +1,854 @@
+// main.js — 连续建造：本地幽灵 + Supercover + 按帧批量发送 + 去重 + 失败回滚
+// 建筑无外框；石头/金子保留外框；箭头增强；扇形开关；小地图；同源 WebSocket
+
+// —— 画布与 UI —— //
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const btnRoad    = document.getElementById('btn-road');
+const btnWall    = document.getElementById('btn-wall');
+const btnTurret  = document.getElementById('btn-turret');
+const btnCiws    = document.getElementById('btn-ciws');
+const btnSniper  = document.getElementById('btn-sniper');
+const btnDemo    = document.getElementById('btn-demo');
+const btnCancel  = document.getElementById('btn-cancel');
+const modeLabel  = document.getElementById('mode-label');
+const goldEl     = document.getElementById('gold');
+const toastEl    = document.getElementById('toast');
+const buildButtons = [btnRoad, btnWall, btnTurret, btnCiws, btnSniper];
+
+// —— 同源 WebSocket 基地址（自动匹配 http→ws / https→wss） —— //
+const WS_URL = location.origin.startsWith('https')
+  ? location.origin.replace(/^https/, 'wss')
+  : location.origin.replace(/^http/,  'ws');
+
+// —— 颜色 —— //
+const COLOR = {
+  // 己方（蓝系）
+  allyCore:   '#2b7bff',
+  allyRoad:   '#6fa8ff',
+  allyWall:   '#1f5fe0',
+  allyTurret: '#4f91ff',
+  allyCiws:   '#3a7aff',
+  allySniper: '#1a54cc',
+  // 敌方（红系）
+  enemyCore:   '#ff3b3b',
+  enemyRoad:   '#ff7a7a',
+  enemyWall:   '#e02a2a',
+  enemyTurret: '#ff5f5f',
+  enemyCiws:   '#ff4242',
+  enemySniper: '#cc1a1a',
+  // 中立
+  rock:   '#7b7b7b',
+  gold:   '#d8b401',
+  // 网格与描边
+  gridA:  '#2a2a2a',
+  gridB:  '#242424',
+  resStroke: '#1a1a1a', // 资源外框
+  // 阵营通用（箭头/预览/扇形/选框）
+  ally:       '#2b7bff',
+  allyLight:  '#75a9ff',
+  enemy:      '#ff3b3b',
+  enemyLight: '#ff8a8a',
+};
+
+// —— 攻击范围开关按钮 —— //
+const btnToggleArcs = document.createElement('button');
+btnToggleArcs.textContent='显示攻击范围';
+Object.assign(btnToggleArcs.style,{
+  position:'fixed',left:'12px',top:'50%',transform:'translateY(-50%)',
+  padding:'8px 10px',border:'1px solid #666',background:'#1f1f1f',
+  color:'#eaeaea',cursor:'pointer',zIndex:9999,borderRadius:'6px'
+});
+document.body.appendChild(btnToggleArcs);
+
+// —— 顶部身份标签 —— //
+const youEl = document.createElement('span');
+youEl.id='you-label';
+youEl.style.marginLeft = '12px';
+document.getElementById('topbar')?.appendChild(youEl);
+
+// —— 常量 —— //
+const CELL=8;
+const DIR_TO_RAD = [0, Math.PI/2, Math.PI, -Math.PI/2];
+const FADE_T = 0.25;               // 子弹淡出
+const GHOST_FADE_T = 0.25;         // 幽灵回滚淡出
+const GHOST_TIMEOUT = 1.0;         // 超时未被服务器采纳则回滚
+const MAX_SEND_PER_FRAME = 160;    // 每帧最大发送建造数
+const MAX_PROCESS_PER_FRAME = 400; // 每帧最大插值格数（防止卡顿）
+
+function deg2rad(d){ return d*Math.PI/180; }
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+
+// —— 小地图 —— //
+const MINI = { size: 160, pad: 10 };
+
+// —— 状态 —— //
+let showArcs=false;
+let mode='browse';
+let selectedType=null;
+let buildFacingDir=0;
+let lastConfirmedDir=0;
+
+let hoverX=-1, hoverY=-1;
+let isMouseDown=false, selecting=false;
+let selectStart=null, selectEnd=null;
+
+// 指针捕获
+let activePointerId=null;
+
+// —— 服务器快照（只读） —— //
+const S = {
+  you: 0,
+  W: 100, H: 100,
+  gold: {1:0,2:0},
+  core: { p1:1000, p2:1000 },
+  map: new Uint8Array(100*100),
+  hp:  new Uint16Array(100*100),
+  owner: new Uint8Array(100*100),
+  turrets: []
+};
+
+// —— 本地子弹（平滑） —— //
+const Local = { bullets: new Map() };
+
+// —— 本地幽灵（未被服务端确认的本地回显） —— //
+const Ghost = {
+  // key: `${x},${y},${w}x${h}`
+  items: new Map(), // value: {x,y,w,h,type,dir,team,alpha,t0,status}
+  placedKeySet: new Set(), // 一次拖动内去重
+  queue: [],               // 待发送建造请求 {x,y,type,dir,key}
+  pendingSet: new Set(),   // key 集
+  cellQueue: []            // 插值待处理队列 [{x,y}]
+};
+
+// —— 背景离屏缓存 —— //
+let bgCanvas=null, bgCtx=null, bgDirty=true;
+
+// —— 简易音效 —— //
+let AC=null;
+function ac(){ if(!AC){ AC=new (window.AudioContext||window.webkitAudioContext)(); } return AC; }
+function beep(freq=600, dur=0.06, vol=0.08){ try{ const a=ac(); const o=a.createOscillator(); const g=a.createGain(); o.type='square'; o.frequency.value=freq; g.gain.value=vol; o.connect(g); g.connect(a.destination); const t=a.currentTime; o.start(t); o.stop(t+dur);}catch{} }
+function sfx_fire(){ beep(760,0.04,0.06); }
+
+// —— 事件 —— //
+btnToggleArcs.onclick = ()=>{
+  showArcs=!showArcs;
+  btnToggleArcs.textContent = showArcs?'隐藏攻击范围':'显示攻击范围';
+};
+
+function labelOf(t){
+  return t==='road'?'道路':t==='wall'?'围墙':t==='turret'?'基础炮':t==='ciws'?'近防炮':t==='sniper'?'狙击炮':'';
+}
+function updateHUD(){
+  goldEl.textContent = S.gold[S.you]||0;
+  youEl.textContent = S.you ? `你是：P${S.you}` : '';
+}
+function toast(msg,ms=1000){
+  toastEl.textContent=msg;
+  toastEl.hidden=false;
+  clearTimeout(toastEl._t);
+  toastEl._t=setTimeout(()=>toastEl.hidden=true,ms);
+}
+
+// —— 模式 —— //
+function enterBuildMode(type){
+  mode='build'; selectedType=type;
+  buildButtons.forEach(b=>b.classList.toggle('active', b.dataset.type===type));
+  btnDemo.classList.remove('active');
+  buildFacingDir = (type==='ciws') ? 0 : lastConfirmedDir; // 近防炮默认向右
+  modeLabel.textContent = `建造模式：${labelOf(type)}（R旋转，长按连续建造）`;
+}
+function enterDemolishMode(){
+  mode='demolish'; selectedType=null;
+  buildButtons.forEach(b=>b.classList.remove('active'));
+  btnDemo.classList.add('active');
+  modeLabel.textContent='拆除模式：拖拽框选，松开后批量拆除（返还50%）';
+}
+function enterBrowseMode(){
+  mode='browse'; selectedType=null;
+  buildButtons.forEach(b=>b.classList.remove('active'));
+  btnDemo.classList.remove('active');
+  modeLabel.textContent='浏览模式（F1 查看帮助）';
+  selecting=false; selectStart=null; selectEnd=null;
+}
+
+function initUI(){
+  btnRoad.onclick   = ()=>enterBuildMode('road');
+  btnWall.onclick   = ()=>enterBuildMode('wall');
+  btnTurret.onclick = ()=>enterBuildMode('turret');
+  btnCiws.onclick   = ()=>enterBuildMode('ciws');
+  btnSniper.onclick = ()=>enterBuildMode('sniper');
+  btnDemo.onclick   = ()=>enterDemolishMode();
+  btnCancel.onclick = ()=>enterBrowseMode();
+
+  window.addEventListener('keydown',(e)=>{
+    const k=e.key.toLowerCase();
+    if(k==='1') enterBuildMode('road');
+    else if(k==='2') enterBuildMode('wall');
+    else if(k==='3') enterBuildMode('turret');
+    else if(k==='4') enterBuildMode('ciws');
+    else if(k==='5') enterBuildMode('sniper');
+    else if(k==='d') enterDemolishMode();
+    else if(e.key==='Escape'||e.key==='Esc') enterBrowseMode();
+    else if(k==='r'){ if(mode==='build'&&selectedType){ buildFacingDir=(buildFacingDir+1)&3; } }
+  });
+}
+
+// —— 坐标转换 —— //
+function pointerToCell(e){
+  const r=canvas.getBoundingClientRect();
+  const px = e.clientX - r.left;
+  const py = e.clientY - r.top;
+  const mx = Math.floor(px / CELL);
+  const my = Math.floor(py / CELL);
+  return {px,py,mx,my};
+}
+
+// —— footprint & 取色 —— //
+function getFootprint(type, dir){
+  if(type==='turret') return {w:2,h:2};
+  if(type==='ciws')   return (dir===0||dir===2)?{w:3,h:2}:{w:2,h:3};
+  if(type==='sniper') return {w:4,h:4};
+  if(type==='road'||type==='wall') return {w:1,h:1};
+  return {w:1,h:1};
+}
+function colorForCell(v, owner, you){
+  const ally = (owner===you);
+  switch(v){
+    case 1:  return COLOR.rock;
+    case 2:  return COLOR.gold;
+    case 3:
+    case 4:  return ally ? COLOR.allyCore   : COLOR.enemyCore;
+    case 10: return ally ? COLOR.allyRoad   : COLOR.enemyRoad;
+    case 11: return ally ? COLOR.allyWall   : COLOR.enemyWall;
+    case 12: return ally ? COLOR.allyTurret : COLOR.enemyTurret;
+    case 13: return ally ? COLOR.allyCiws   : COLOR.enemyCiws;
+    case 14: return ally ? COLOR.allySniper : COLOR.enemySniper;
+    default: return null;
+  }
+}
+function colorForType(type, ally){
+  if(ally){
+    if(type==='core')   return COLOR.allyCore;
+    if(type==='road')   return COLOR.allyRoad;
+    if(type==='wall')   return COLOR.allyWall;
+    if(type==='turret') return COLOR.allyTurret;
+    if(type==='ciws')   return COLOR.allyCiws;
+    if(type==='sniper') return COLOR.allySniper;
+  }else{
+    if(type==='core')   return COLOR.enemyCore;
+    if(type==='road')   return COLOR.enemyRoad;
+    if(type==='wall')   return COLOR.enemyWall;
+    if(type==='turret') return COLOR.enemyTurret;
+    if(type==='ciws')   return COLOR.enemyCiws;
+    if(type==='sniper') return COLOR.enemySniper;
+  }
+  return ally ? COLOR.ally : COLOR.enemy;
+}
+
+// —— 校验（客户端粗过滤） —— //
+function inBounds(x,y){ return x>=0&&y>=0&&x<S.W&&y<S.H; }
+function rectInBounds(x,y,w,h){ return x>=0&&y>=0&&(x+w)<=S.W&&(y+h)<=S.H; }
+function areaEmptyClient(x,y,w,h){
+  for(let j=0;j<h;j++) for(let i=0;i<w;i++){
+    if(S.map[(y+j)*S.W+(x+i)]!==0) return false;
+  }
+  return true;
+}
+function rectCanBuildHereClient(x,y,w,h){
+  const xmin=Math.max(0,x-1), xmax=Math.min(S.W-1,x+w);
+  const ymin=Math.max(0,y-1), ymax=Math.min(S.H-1,y+h);
+  for(let yy=ymin;yy<=ymax;yy++){
+    for(let xx=xmin;xx<=xmax;xx++){
+      const onPerimeter=(xx<x||xx>=x+w||yy<y||yy>=y+h);
+      if(!onPerimeter) continue;
+      const i=yy*S.W+xx;
+      const v=S.map[i];
+      const o=S.owner[i];
+      const isBuilding = (v===3||v===4||v===10||v===11||v===12||v===13||v===14);
+      if(isBuilding && o===S.you) return true;
+    }
+  }
+  return false;
+}
+
+// —— Supercover：覆盖直线经过的所有格 —— //
+function supercoverLineCells(x0,y0,x1,y1){
+  const cells=[];
+  let dx=x1-x0, dy=y1-y0;
+  const sx = Math.sign(dx)||1, sy = Math.sign(dy)||1;
+  dx=Math.abs(dx); dy=Math.abs(dy);
+  let x=x0, y=y0; cells.push({x,y});
+  if(dx>=dy){
+    let f=0;
+    for(let i=0;i<dx;i++){
+      x+=sx; f+=dy;
+      if(f>=dx){ y+=sy; f-=dx; cells.push({x,y}); }
+      cells.push({x,y});
+    }
+  }else{
+    let f=0;
+    for(let i=0;i<dy;i++){
+      y+=sy; f+=dx;
+      if(f>=dy){ x+=sx; f-=dy; cells.push({x,y}); }
+      cells.push({x,y});
+    }
+  }
+  const out=[]; const seen=new Set();
+  for(const c of cells){ const k=c.x+'|'+c.y; if(!seen.has(k)){ seen.add(k); out.push(c);} }
+  return out;
+}
+
+// —— 幽灵 & 发送入队 —— //
+function enqueueGhostAndSend(type, x, y, dir){
+  const fp=getFootprint(type, dir);
+  const key = `${x},${y},${fp.w}x${fp.h}`;
+  if(Ghost.pendingSet.has(key)) return; // 已在队列/已放置
+  if(!rectInBounds(x,y,fp.w,fp.h)) return;
+  if(!areaEmptyClient(x,y,fp.w,fp.h)) return;
+  if(!rectCanBuildHereClient(x,y,fp.w,fp.h)) return;
+
+  Ghost.pendingSet.add(key);
+  Ghost.queue.push({x,y,type,dir,key});
+
+  // 本地幽灵回显
+  Ghost.items.set(key, {
+    x,y,w:fp.w,h:fp.h,type,dir,team:S.you,alpha:0.9,t0:performance.now(),status:'pending'
+  });
+}
+
+// 每帧发送有限数量
+function flushBuildQueue(){
+  let quota = MAX_SEND_PER_FRAME;
+  while(quota>0 && Ghost.queue.length){
+    const it = Ghost.queue.shift();
+    quota--;
+    Net.build(it.type, it.x, it.y, it.dir);
+    const g = Ghost.items.get(it.key);
+    if(g){ g.t0 = performance.now(); g.status='pending'; }
+  }
+}
+
+// —— 指针事件：只记录路径点，由 RAF 消费 —— //
+let lastDragCell = null;
+
+function initPointer(){
+  function handleMoveLike(e){
+    const p = pointerToCell(e);
+    hoverX=p.mx; hoverY=p.my;
+
+    if(isMouseDown && activePointerId===e.pointerId){
+      if(mode==='build' && selectedType){
+        if(lastDragCell==null){
+          lastDragCell={x:p.mx,y:p.my};
+          Ghost.cellQueue.push({x:p.mx,y:p.my});
+        }else{
+          const list = supercoverLineCells(lastDragCell.x,lastDragCell.y,p.mx,p.my);
+          for(const c of list) Ghost.cellQueue.push(c);
+          lastDragCell={x:p.mx,y:p.my};
+        }
+      }else if(mode==='demolish' && selecting){
+        selectEnd={x:p.mx,y:p.my};
+      }
+    }
+  }
+
+  canvas.addEventListener('pointerrawupdate', handleMoveLike);
+  canvas.addEventListener('pointermove', handleMoveLike);
+
+  canvas.addEventListener('pointerdown',(e)=>{
+    if(e.button!==0) return;
+    activePointerId=e.pointerId;
+    canvas.setPointerCapture(activePointerId);
+    const p = pointerToCell(e);
+    isMouseDown=true;
+    if(mode==='build'&&selectedType){
+      Ghost.placedKeySet.clear();
+      lastDragCell={x:p.mx,y:p.my};
+      Ghost.cellQueue.push({x:p.mx,y:p.my});
+    }else if(mode==='demolish'){
+      selecting=true; selectStart={x:p.mx,y:p.my}; selectEnd={x:p.mx,y:p.my};
+    }
+  });
+
+  function endPointer(e){
+    if(e.pointerId!==activePointerId) return;
+    isMouseDown=false; activePointerId=null;
+    lastDragCell=null;
+    if(mode==='demolish'&&selecting&&selectStart&&selectEnd){
+      Net.demolish(selectStart.x,selectStart.y,selectEnd.x,selectEnd.y);
+    }
+    selecting=false; selectStart=null; selectEnd=null;
+    try{ canvas.releasePointerCapture(e.pointerId); }catch{}
+  }
+  canvas.addEventListener('pointerup',endPointer);
+  canvas.addEventListener('pointercancel',endPointer);
+  canvas.addEventListener('contextmenu',(e)=>e.preventDefault());
+}
+
+// —— RAF 消费路径点：逐帧限额补建 + 入队发送 —— //
+function consumeCellQueue(){
+  let quota = MAX_PROCESS_PER_FRAME;
+  while(quota>0 && Ghost.cellQueue.length){
+    const c = Ghost.cellQueue.shift();
+    quota--;
+    if(!inBounds(c.x,c.y)) continue;
+    const fp=getFootprint(selectedType||'road', buildFacingDir);
+    const k=`${c.x},${c.y},${fp.w}x${fp.h}`;
+    if(Ghost.placedKeySet.has(k)) continue;
+    Ghost.placedKeySet.add(k);
+    if(mode==='build' && selectedType){
+      enqueueGhostAndSend(selectedType, c.x, c.y, buildFacingDir);
+      lastConfirmedDir = buildFacingDir;
+    }
+  }
+}
+
+// —— 联机 —— //
+function connectOnline(){
+  const roomId = prompt('输入房间号（6位，例如 A1B2C3）：','A1B2C3') || 'A1B2C3';
+  const name   = prompt('输入昵称：','Relice') || 'Relice';
+  const create = confirm('是否创建该房间？（确定=创建；取消=加入）');
+
+  Net.onRoom = (m)=>{
+    const allReady = m.players?.every?.(p=>p.ready) ?? true;
+    if(!allReady){
+      if(confirm('进入准备并开始？')){
+        Net.ready(true);
+      }
+    }
+  };
+  Net.onStart = (m)=>{
+    S.you = m.you; S.W=m.W; S.H=m.H;
+    canvas.width  = S.W*CELL;
+    canvas.height = S.H*CELL;
+    bgDirty = true;
+    updateHUD();
+  };
+  Net.onState = (m)=>{
+    const hadBullets = Local.bullets.size;
+    S.gold   = m.gold;
+    S.core   = m.core;
+    S.map    = new Uint8Array(m.map);
+    S.hp     = new Uint16Array(m.hp);
+    S.owner  = new Uint8Array(m.owner);
+    S.turrets= m.turrets;
+    bgDirty = true;
+
+    reconcileBulletsFromServer(m.bullets);
+    if(Local.bullets.size > hadBullets) sfx_fire();
+    updateHUD();
+
+    reconcileGhostsWithServer();
+  };
+  Net.onEnded = (m)=>{ toast(m.winner===S.you?'你获胜':'你失败', 3000); };
+  Net.onError = (e)=>{ alert('联机错误：'+(e.code||'UNKNOWN')); };
+
+  Net.connect({ roomId, name, create }); // 使用同源 WS_URL（见底部 Net 实现）
+  setTimeout(()=>Net.ready(true), 500);
+}
+
+function reconcileGhostsWithServer(){
+  const now = performance.now();
+  for(const [key,g] of Ghost.items){
+    // 判断该区域是否已被服务器确认落地为我方建筑
+    let ok = true;
+    for(let j=0;j<g.h;j++){
+      for(let i=0;i<g.w;i++){
+        const idx = (g.y+j)*S.W + (g.x+i);
+        const v = S.map[idx], o = S.owner[idx];
+        let expectV = 0;
+        if(g.type==='core')   expectV = (S.you===1)?3:4;
+        if(g.type==='road')   expectV = 10;
+        if(g.type==='wall')   expectV = 11;
+        if(g.type==='turret') expectV = 12;
+        if(g.type==='ciws')   expectV = 13;
+        if(g.type==='sniper') expectV = 14;
+        if(v!==expectV || o!==S.you){ ok=false; break; }
+      }
+      if(!ok) break;
+    }
+    if(ok){
+      Ghost.items.delete(key); Ghost.pendingSet.delete(key);
+    }else{
+      if((now - g.t0)/1000 > GHOST_TIMEOUT && g.status==='pending'){
+        g.status='rejected';
+        g.alpha=0.9;
+      }
+    }
+  }
+}
+
+// —— 子弹融合 —— //
+function reconcileBulletsFromServer(serverList){
+  const seen = new Set();
+  for(const sb of serverList){
+    seen.add(sb.id);
+    const lb = Local.bullets.get(sb.id);
+    if(!lb){
+      Local.bullets.set(sb.id, { x:sb.x, y:sb.y, vx:sb.vx, vy:sb.vy, team:sb.team, fade:sb.fade||0, dead:false });
+    }else{
+      const blend = 0.2;
+      lb.x += (sb.x - lb.x) * blend;
+      lb.y += (sb.y - lb.y) * blend;
+      lb.vx = sb.vx; lb.vy = sb.vy; lb.team = sb.team;
+      lb.fade = sb.fade||0; lb.dead=false;
+    }
+  }
+  for(const [id, lb] of Local.bullets){
+    if(!seen.has(id) && !lb.dead){
+      lb.dead = true;
+      if(lb.fade<=0) lb.fade = FADE_T;
+    }
+  }
+}
+function updateLocal(dt){
+  for(const [id, b] of Local.bullets){
+    if(b.fade>0){ b.fade -= dt; if(b.fade<=0){ Local.bullets.delete(id); continue; } }
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+  }
+
+  // 幽灵回滚淡出
+  for(const [key,g] of [...Ghost.items]){
+    if(g.status==='rejected'){
+      g.alpha -= dt / GHOST_FADE_T;
+      if(g.alpha<=0){ Ghost.items.delete(key); Ghost.pendingSet.delete(key); }
+    }
+  }
+}
+
+// —— 背景缓存（建筑无外框；资源有外框） —— //
+function ensureBG(){
+  if(!bgCanvas || bgCanvas.width!==canvas.width || bgCanvas.height!==canvas.height){
+    bgCanvas = document.createElement('canvas');
+    bgCanvas.width = canvas.width;
+    bgCanvas.height = canvas.height;
+    bgCtx = bgCanvas.getContext('2d');
+    bgDirty = true;
+  }
+  if(!bgDirty) return;
+
+  const W=S.W, H=S.H;
+  // 棋盘
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+    bgCtx.fillStyle=((x+y)&1)?COLOR.gridA:COLOR.gridB;
+    bgCtx.fillRect(x*CELL,y*CELL,CELL,CELL);
+  }
+  // 地块（静态）
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+    const idx=y*W+x; const v=S.map[idx]; if(!v) continue;
+    const o=S.owner[idx];
+    const fill=colorForCell(v, o, S.you);
+    if(!fill) continue;
+
+    bgCtx.fillStyle = fill;
+    bgCtx.fillRect(x*CELL,y*CELL,CELL,CELL);
+
+    if(v===1 || v===2){
+      bgCtx.lineWidth = 0.75;
+      bgCtx.strokeStyle = COLOR.resStroke;
+      bgCtx.strokeRect(x*CELL+0.35, y*CELL+0.35, CELL-0.7, CELL-0.7);
+    }
+  }
+  bgDirty = false;
+}
+
+// —— 绘制幽灵（半透明覆写，不改 BG） —— //
+function drawGhosts(){
+  for(const g of Ghost.items.values()){
+    const ally = (g.team===S.you);
+    const fill = colorForType(g.type, ally);
+    const alpha = clamp(g.alpha, 0, 0.9);
+    if(alpha<=0) continue;
+
+    ctx.save();
+    ctx.globalAlpha = alpha*0.7;
+    ctx.fillStyle = fill;
+    ctx.fillRect(g.x*CELL, g.y*CELL, g.w*CELL, g.h*CELL);
+    ctx.restore();
+
+    // 预览扇形/箭头（仅非核心）
+    const arc=(g.type==='turret')?90:(g.type==='ciws')?180:(g.type==='sniper')?45:(g.type==='core')?360:0;
+    const range=(g.type==='turret')?8:(g.type==='ciws')?3:(g.type==='sniper')?20:(g.type==='core')?16:0;
+    if(arc>0){
+      const cenDir = (g.type==='ciws') ? ((g.dir+1)&3) : g.dir;
+      const cx=(g.x+g.w*0.5)*CELL, cy=(g.y+g.h*0.5)*CELL;
+      const r=range*CELL;
+      ctx.save(); ctx.globalAlpha=0.16;
+      ctx.fillStyle = ally?COLOR.allyLight:COLOR.enemyLight;
+      if(arc<360){
+        const center=DIR_TO_RAD[cenDir|0];
+        ctx.beginPath();
+        const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2;
+        ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill();
+      }else{
+        ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill();
+      }
+      ctx.restore();
+
+      if(g.type!=='core'){
+        const color = ally?COLOR.ally:COLOR.enemy;
+        drawArrow(cx, cy, cenDir, Math.min(g.w,g.h)*CELL*0.9, color, 0.9);
+      }
+    }
+  }
+}
+
+// —— 主绘制 —— //
+function draw(){
+  ensureBG();
+  ctx.drawImage(bgCanvas, 0, 0);
+
+  // 服务端扇形/核心圆
+  if(showArcs){
+    for(const t of S.turrets){
+      const r=t.rangeCells*CELL;
+      const colorFill=(t.team===S.you)?COLOR.allyLight:COLOR.enemyLight;
+      if(t.arcDeg<360){
+        const center=DIR_TO_RAD[t.facingDir|0];
+        ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill;
+        ctx.beginPath();
+        const a0=center-deg2rad(t.arcDeg)/2, a1=center+deg2rad(t.arcDeg)/2;
+        ctx.moveTo(t.cx*CELL,t.cy*CELL);
+        ctx.arc(t.cx*CELL,t.cy*CELL,r,a0,a1);
+        ctx.closePath(); ctx.fill(); ctx.restore();
+      }else{
+        ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill;
+        ctx.beginPath(); ctx.arc(t.cx*CELL,t.cy*CELL,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore();
+      }
+    }
+  }
+
+  // 炮台方向箭头（核心不画；增强）
+  for(const t of S.turrets){
+    if(t.role==='core') continue;
+    const color = (t.team===S.you)?COLOR.ally:COLOR.enemy;
+    drawArrow(t.cx*CELL, t.cy*CELL, t.facingDir, Math.min(t.w,t.h)*CELL*0.9, color, 0.95);
+  }
+
+  // 幽灵建筑（本地回显层）
+  drawGhosts();
+
+  // 子弹
+  for(const [_, b] of Local.bullets){
+    const alpha = (b.fade>0) ? clamp(b.fade/FADE_T, 0, 1) : 1;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = (b.team===S.you)?'#ffffff':'#ffd1d1';
+    ctx.fillRect(b.x*CELL-2, b.y*CELL-2, 4,4);
+    ctx.globalAlpha = 1;
+  }
+
+  // 建造预览框
+  if(mode==='build'&&selectedType&&hoverX>=0&&hoverY>=0){
+    const fp=getFootprint(selectedType, buildFacingDir);
+    const ok=rectInBounds(hoverX,hoverY,fp.w,fp.h)&&areaEmptyClient(hoverX,hoverY,fp.w,fp.h)&&rectCanBuildHereClient(hoverX,hoverY,fp.w,fp.h);
+    ctx.globalAlpha=0.35; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+    ctx.fillRect(hoverX*CELL,hoverY*CELL,fp.w*CELL,fp.h*CELL); ctx.globalAlpha=1;
+    ctx.lineWidth=1; ctx.strokeStyle=ok?COLOR.allyLight:COLOR.enemyLight;
+    ctx.strokeRect(hoverX*CELL+0.5,hoverY*CELL+0.5,fp.w*CELL-1,fp.h*CELL-1);
+
+    const arc=(selectedType==='turret')?90:(selectedType==='ciws')?180:(selectedType==='sniper')?45:(selectedType==='core')?360:0;
+    const range=(selectedType==='turret')?8:(selectedType==='ciws')?3:(selectedType==='sniper')?20:(selectedType==='core')?16:0;
+    if(arc>0){
+      const cx=(hoverX+fp.w*0.5)*CELL, cy=(hoverY+fp.h*0.5)*CELL;
+      const cenDir = (selectedType==='ciws') ? ((buildFacingDir+1)&3) : buildFacingDir;
+      const center=DIR_TO_RAD[cenDir|0]; const r=range*CELL;
+
+      if(arc<360){
+        ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+        ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2;
+        ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); ctx.restore();
+      }else{
+        ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+        ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore();
+      }
+
+      if(selectedType!=='core'){
+        const colorPreview = ok ? COLOR.ally : COLOR.enemy;
+        drawArrow(cx, cy, cenDir, Math.min(fp.w,fp.h)*CELL*0.9, colorPreview, 0.95);
+      }
+    }
+  }else if(mode==='demolish'&&selecting&&selectStart&&selectEnd){
+    const x0=Math.min(selectStart.x,selectEnd.x)*CELL;
+    const x1=(Math.max(selectStart.x,selectEnd.x)+1)*CELL;
+    const y0=Math.min(selectStart.y,selectEnd.y)*CELL;
+    const y1=(Math.max(selectStart.y,selectEnd.y)+1)*CELL;
+    const w=x1-x0, h=y1-y0;
+    ctx.globalAlpha=0.25; ctx.fillStyle=COLOR.enemy; ctx.fillRect(x0,y0,w,h); ctx.globalAlpha=1;
+    ctx.lineWidth=2; ctx.setLineDash([6,4]); ctx.strokeStyle=COLOR.enemyLight;
+    ctx.strokeRect(x0+1,y0+1,w-2,h-2); ctx.setLineDash([]);
+  }
+
+  drawMiniMap();
+}
+
+// —— 小地图（仅资源描边） —— //
+function miniRect(){
+  const size=MINI.size, pad=MINI.pad;
+  return { x: canvas.width - size - pad, y: pad, w: size, h: size };
+}
+function drawMiniMap(){
+  const r = miniRect();
+  ctx.save();
+  ctx.globalAlpha=0.9; ctx.fillStyle='#111'; ctx.fillRect(r.x-2, r.y-2, r.w+4, r.h+4);
+  ctx.globalAlpha=1; ctx.strokeStyle='#444'; ctx.lineWidth=1; ctx.strokeRect(r.x-2.5, r.y-2.5, r.w+5, r.h+5);
+
+  const sx = r.w / S.W, sy = r.h / S.H;
+  for(let y=0;y<S.H;y++){
+    for(let x=0;x<S.W;x++){
+      const idx = y*S.W+x; const v=S.map[idx]; if(!v) continue;
+      const o=S.owner[idx];
+      const c = colorForCell(v, o, S.you);
+      if(!c) continue;
+
+      const px = Math.floor(r.x + x*sx);
+      const py = Math.floor(r.y + y*sy);
+      const pw = Math.max(1, Math.ceil(sx));
+      const ph = Math.max(1, Math.ceil(sy));
+
+      ctx.fillStyle=c;
+      ctx.fillRect(px, py, pw, ph);
+
+      if(v===1 || v===2){
+        ctx.strokeStyle = COLOR.resStroke;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(px+0.5, py+0.5, pw-1, ph-1);
+      }
+    }
+  }
+  ctx.fillStyle='#ddd'; ctx.font='12px Segoe UI, Arial';
+  ctx.fillText('小地图', r.x, r.y - 6);
+  ctx.restore();
+}
+
+// —— 箭头（增强版） —— //
+function drawArrow(cx, cy, facingDir, size, color, alpha=1){
+  size *= 1.25;
+  const base = size*0.6, height = size*0.8, halfBase = base/2;
+  const pts = [{x:+height/2,y:0},{x:-height/2,y:-halfBase},{x:-height/2,y:+halfBase}];
+  const ang = [0, Math.PI/2, Math.PI, -Math.PI/2][facingDir|0];
+
+  ctx.save();
+  ctx.translate(cx,cy);
+  ctx.rotate(ang);
+  ctx.globalAlpha = alpha;
+  ctx.lineJoin = 'round'; ctx.lineCap='round';
+
+  ctx.shadowColor = 'rgba(0,0,0,0.45)';
+  ctx.shadowBlur = Math.max(4, size*0.18);
+
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x,pts[0].y);
+  ctx.lineTo(pts[1].x,pts[1].y);
+  ctx.lineTo(pts[2].x,pts[2].y);
+  ctx.closePath();
+  ctx.strokeStyle = 'rgba(0,0,0,0.95)';
+  ctx.lineWidth = Math.max(2.2, size*0.14);
+  ctx.stroke();
+
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = Math.max(1.2, size*0.06);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// —— 帧循环 —— //
+let _rafLast = performance.now();
+function loop(ts){
+  const dt = Math.min(0.05, (ts - _rafLast)/1000);
+  _rafLast = ts;
+
+  // 逐帧消化采样格 & 入队发送
+  consumeCellQueue();
+  flushBuildQueue();
+
+  updateLocal(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// —— 启动 —— //
+function initAll(){
+  initUI();
+  initPointer();
+  updateHUD();
+  document.getElementById('btn-online')?.addEventListener('click', connectOnline);
+  requestAnimationFrame(loop);
+}
+initAll();
+
+// === 固定顶/底栏空间自适配（方式2） ===
+(function () {
+  function reserveSpaceForFixedBars() {
+    const d = document;
+    const top = d.getElementById('topbar');
+    const bottom = d.getElementById('bottombar');
+    const topH = top ? top.getBoundingClientRect().height : 0;
+    const bottomH = bottom ? bottom.getBoundingClientRect().height : 0;
+    d.body.style.paddingTop = topH + 'px';
+    d.body.style.paddingBottom = (bottomH + 8) + 'px';
+  }
+  window.addEventListener('load', reserveSpaceForFixedBars);
+  window.addEventListener('resize', reserveSpaceForFixedBars);
+  const ro = new ResizeObserver(reserveSpaceForFixedBars);
+  const topEl = document.getElementById('topbar');
+  const bottomEl = document.getElementById('bottombar');
+  if (topEl) ro.observe(topEl);
+  if (bottomEl) ro.observe(bottomEl);
+  const mo = new MutationObserver(() => {
+    ro.disconnect();
+    const t = document.getElementById('topbar');
+    const b = document.getElementById('bottombar');
+    if (t) ro.observe(t);
+    if (b) ro.observe(b);
+    reserveSpaceForFixedBars();
+  });
+  mo.observe(document.documentElement, { childList: true, subtree: true });
+  window.__reserveFixedBars = reserveSpaceForFixedBars;
+})();
+
+
+// —— Net 传输层（若页面中已存在 Net 则不覆盖；使用同源 WS_URL） —— //
+(function(){
+  if (window.Net) return;
+  const Net = {};
+  let ws=null;
+
+  Net.onRoom = ()=>{};
+  Net.onStart= ()=>{};
+  Net.onState= ()=>{};
+  Net.onEnded= ()=>{};
+  Net.onError= (e)=>{ console.error(e); };
+
+  Net.connect = function({roomId='A1B2C3', name='Relice', create=true}={}){
+    ws = new WebSocket(WS_URL);
+    ws.onopen = ()=> {
+      ws.send(JSON.stringify({type:'join', roomId, name, create}));
+    };
+    ws.onmessage = (ev)=>{
+      let m; try{ m=JSON.parse(ev.data);}catch{ return; }
+      switch(m.type){
+        case 'room':  Net.onRoom(m); break;
+        case 'start': Net.onStart(m); break;
+        case 'state': Net.onState(m); break;
+        case 'ended': Net.onEnded(m); break;
+        default: break;
+      }
+    };
+    ws.onerror = (e)=> Net.onError(e);
+    ws.onclose = ()=>{};
+    Net._ws = ws;
+  };
+  Net.ready = function(flag){ ws && ws.send(JSON.stringify({type:'ready', ready: !!flag})); };
+  Net.build = function(kind,x,y,dir){ ws && ws.send(JSON.stringify({type:'build', kind, x, y, dir})); };
+  Net.demolish = function(x0,y0,x1,y1){ ws && ws.send(JSON.stringify({type:'demolish', x0,y0,x1,y1})); };
+
+  window.Net = Net;
+})();

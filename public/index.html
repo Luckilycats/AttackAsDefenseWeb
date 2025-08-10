@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>以攻为守 - 网页版</title>
+<style>
+  body{margin:0;background:#1a1a1a;color:#eaeaea;font-family:Segoe UI,Arial;}
+  #topbar{padding:8px 12px;display:flex;gap:12px;align-items:center;border-bottom:1px solid #333;}
+  #hud{margin-left:auto;}
+  #toolbar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;align-items:center;justify-content:center;padding:8px;border-top:1px solid #333;background:#111;}
+  #toolbar button.active{outline:2px solid #2bd900}
+  #toast{position:fixed;right:12px;bottom:60px;background:#222;padding:6px 10px;border:1px solid #444;border-radius:6px}
+  canvas{display:block;margin:0 auto;}
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <button id="btn-online">联机</button>
+    <span id="mode-label">浏览模式</span>
+    <div id="hud">金币：<span id="gold">0</span></div>
+  </div>
+
+  <canvas id="game" width="800" height="800"></canvas>
+
+  <div id="toolbar">
+    <button id="btn-road"   data-type="road">道路(1)</button>
+    <button id="btn-wall"   data-type="wall">围墙(2)</button>
+    <button id="btn-turret" data-type="turret">基础炮(3)</button>
+    <button id="btn-ciws"   data-type="ciws">近防炮(4)</button>
+    <button id="btn-sniper" data-type="sniper">狙击炮(5)</button>
+    <button id="btn-demo">拆除(D)</button>
+    <button id="btn-cancel">取消(Esc)</button>
+  </div>
+
+  <div id="toast" hidden>提示</div>
+
+  <!-- 顺序必须：先 network.js，再 main.js -->
+  <script src="network.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
