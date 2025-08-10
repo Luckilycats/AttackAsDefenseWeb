@@ -1,5 +1,5 @@
 // main.js — 连续建造：本地幽灵 + Supercover + 按帧批量发送 + 去重 + 失败回滚
-// 建筑无外框；石头/金子保留外框；扇形开关；小地图离屏；同源 WebSocket
+// 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
 // 性能优化：Path2D 箭头、子弹数组视图 + 降采样、装饰层自适应跳过、幽灵批量绘制
 
 // —— 画布与 UI —— //
@@ -45,7 +45,7 @@ const COLOR = {
   // 网格与描边
   gridA:  '#2a2a2a',
   gridB:  '#242424',
-  resStroke: '#1a1a1a', // 资源外框
+  resStroke: '#1a1a1a',
   // 阵营通用（预览/扇形/选框）
   ally:       '#2b7bff',
   allyLight:  '#75a9ff',
@@ -76,7 +76,7 @@ const FADE_T = 0.25;               // 子弹淡出（已不再使用）
 const GHOST_FADE_T = 0.25;         // 幽灵回滚淡出
 const GHOST_TIMEOUT = 1.0;         // 超时未被服务器采纳则回滚
 const MAX_SEND_PER_FRAME = 160;    // 每帧最大发送建造数
-const MAX_PROCESS_PER_FRAME = 400; // 每帧最大插值格数（防止卡顿）
+const MAX_PROCESS_PER_FRAME = 400; // 每帧最大插值格数
 
 function deg2rad(d){ return d*Math.PI/180; }
 function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
@@ -84,11 +84,6 @@ function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
 // —— 性能状态 —— //
 let _lastFrameCostMs = 0;
 let _skipDecor = false; // 跳过装饰层（箭头、扇形）以稳帧
-
-// —— 小地图 —— //
-const MINI = { size: 160, pad: 10 };
-// 离屏小地图缓存
-let miniCanvas=null, miniCtx=null, miniDirty=true;
 
 // —— 状态 —— //
 let showArcs=false;
@@ -163,7 +158,7 @@ function enterBuildMode(type){
   mode='build'; selectedType=type;
   buildButtons.forEach(b=>b.classList.toggle('active', b.dataset.type===type));
   btnDemo.classList.remove('active');
-  buildFacingDir = (type==='ciws') ? 0 : lastConfirmedDir; // 近防炮默认向右
+  buildFacingDir = (type==='ciws') ? 0 : lastConfirmedDir;
   modeLabel.textContent = `建造模式：${labelOf(type)}（R旋转，长按连续建造）`;
 }
 function enterDemolishMode(){
@@ -349,7 +344,7 @@ function drawArrowFast(cx, cy, facingDir, size, color, alpha=1){
 function enqueueGhostAndSend(type, x, y, dir){
   const fp=getFootprint(type, dir);
   const key = `${x},${y},${fp.w}x${fp.h}`;
-  if(Ghost.pendingSet.has(key)) return; // 已在队列/已放置
+  if(Ghost.pendingSet.has(key)) return;
   if(!rectInBounds(x,y,fp.w,fp.h)) return;
   if(!areaEmptyClient(x,y,fp.w,fp.h)) return;
   if(!rectCanBuildHereClient(x,y,fp.w,fp.h)) return;
@@ -357,7 +352,6 @@ function enqueueGhostAndSend(type, x, y, dir){
   Ghost.pendingSet.add(key);
   Ghost.queue.push({x,y,type,dir,key});
 
-  // 本地幽灵回显
   Ghost.items.set(key, {
     x,y,w:fp.w,h:fp.h,type,dir,team:S.you,alpha:0.9,t0:performance.now(),status:'pending'
   });
@@ -469,7 +463,6 @@ function connectOnline(){
     canvas.width  = S.W*CELL;
     canvas.height = S.H*CELL;
     bgDirty = true;
-    miniDirty = true;
     updateHUD();
   };
   Net.onState = (m)=>{
@@ -481,7 +474,6 @@ function connectOnline(){
     S.owner  = new Uint8Array(m.owner);
     S.turrets= m.turrets;
     bgDirty = true;
-    miniDirty = true; // 地图状态变更时重绘离屏小地图
 
     reconcileBulletsFromServer(m.bullets);
     if(Local.bullets.size > hadBullets) sfx_fire();
@@ -492,14 +484,13 @@ function connectOnline(){
   Net.onEnded = (m)=>{ toast(m.winner===S.you?'你获胜':'你失败', 3000); };
   Net.onError = (e)=>{ alert('联机错误：'+(e.code||'UNKNOWN')); };
 
-  Net.connect({ roomId, name, create }); // 使用同源 WS_URL（见底部 Net 实现）
+  Net.connect({ roomId, name, create });
   setTimeout(()=>Net.ready(true), 500);
 }
 
 function reconcileGhostsWithServer(){
   const now = performance.now();
   for(const [key,g] of Ghost.items){
-    // 判断该区域是否已被服务器确认落地为我方建筑
     let ok = true;
     for(let j=0;j<g.h;j++){
       for(let i=0;i<g.w;i++){
@@ -545,10 +536,9 @@ function reconcileBulletsFromServer(serverList){
   }
   for(const [id, lb] of Local.bullets){
     if(!seen.has(id)){
-      Local.bullets.delete(id); // 直接移除
+      Local.bullets.delete(id);
     }
   }
-  // 重建数组视图（成本低）
   Local.arr = Array.from(Local.bullets.values());
 }
 
@@ -610,44 +600,6 @@ function ensureBG(){
     }
   }
   bgDirty = false;
-}
-
-// —— 小地图离屏重绘 —— //
-function ensureMini(){
-  if(!miniCanvas){
-    miniCanvas = document.createElement('canvas');
-    miniCanvas.width = MINI.size;
-    miniCanvas.height = MINI.size;
-    miniCtx = miniCanvas.getContext('2d');
-    miniDirty = true;
-  }
-  if(!miniDirty) return;
-
-  miniCtx.clearRect(0,0,MINI.size,MINI.size);
-  const sx = MINI.size / S.W, sy = MINI.size / S.H;
-
-  for(let y=0;y<S.H;y++){
-    for(let x=0;x<S.W;x++){
-      const idx = y*S.W+x; const v=S.map[idx]; if(!v) continue;
-      const o=S.owner[idx];
-      const c = colorForCell(v, o, S.you); if(!c) continue;
-
-      const px = Math.floor(x*sx);
-      const py = Math.floor(y*sy);
-      const pw = Math.max(1, Math.ceil(sx));
-      const ph = Math.max(1, Math.ceil(sy));
-
-      miniCtx.fillStyle=c;
-      miniCtx.fillRect(px, py, pw, ph);
-
-      if(v===1 || v===2){
-        miniCtx.strokeStyle = COLOR.resStroke;
-        miniCtx.lineWidth = 1;
-        miniCtx.strokeRect(px+0.5, py+0.5, pw-1, ph-1);
-      }
-    }
-  }
-  miniDirty = false;
 }
 
 // —— 幽灵绘制（批量填充 + 可选扇形/箭头预览） —— //
@@ -810,28 +762,6 @@ function draw(){
     ctx.lineWidth=2; ctx.setLineDash([6,4]); ctx.strokeStyle=COLOR.enemyLight;
     ctx.strokeRect(x0+1,y0+1,w-2,h-2); ctx.setLineDash([]);
   }
-
-  drawMiniMap();
-}
-
-// —— 小地图（仅资源描边） —— //
-function miniRect(){
-  const size=MINI.size, pad=MINI.pad;
-  return { x: canvas.width - size - pad, y: pad, w: size, h: size };
-}
-function drawMiniMap(){
-  ensureMini();
-  const r = miniRect();
-  ctx.save();
-  ctx.globalAlpha=0.9; ctx.fillStyle='#111'; ctx.fillRect(r.x-2, r.y-2, r.w+4, r.h+4);
-  ctx.globalAlpha=1; ctx.strokeStyle='#444'; ctx.lineWidth=1; ctx.strokeRect(r.x-2.5, r.y-2.5, r.w+5, r.h+5);
-
-  // 直接贴离屏小地图
-  ctx.drawImage(miniCanvas, r.x, r.y, r.w, r.h);
-
-  ctx.fillStyle='#ddd'; ctx.font='12px Segoe UI, Arial';
-  ctx.fillText('小地图', r.x, r.y - 6);
-  ctx.restore();
 }
 
 // —— 帧循环 —— //
