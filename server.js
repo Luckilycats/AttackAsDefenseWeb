@@ -101,7 +101,7 @@ function genMap(room){
   const {map,hp,owner} = room;
   map.fill(0); hp.fill(0); owner.fill(0);
 
-  // 石头：~40%
+  // 石头：~40% 随机撒点（保持原样）
   for(let y=0;y<H;y++){
     for(let x=0;x<W;x++){
       if(Math.random()<0.40){
@@ -109,24 +109,24 @@ function genMap(room){
       }
     }
   }
-  // 金子：聚类
-  const clusters = 32;
+  // 金子：低频聚类（仅降低“刷新概率”，其余参数不改）
+  const clusters = 32;              // 保持原值
   for(let k=0;k<clusters;k++){
     const cx = 4+Math.floor(Math.random()*(W-8));
     const cy = 4+Math.floor(Math.random()*(H-8));
-    const r  = 3+Math.floor(Math.random()*3);
+    const r  = 3+Math.floor(Math.random()*3); // 3~5，保持原值
     for(let y=cy-r;y<=cy+r;y++){
       for(let x=cx-r;x<=cx+r;x++){
         if(x<0||y<0||x>=W||y>=H) continue;
         const d2=(x-cx)*(x-cx)+(y-cy)*(y-cy);
-        if(d2<=r*r && Math.random()<0.55){
+        if(d2<=r*r && Math.random()<0.25){    // ★ 仅此处从 0.55 下调为 0.25
           setCell(room,x,y,ID_GOLD,HP[ID_GOLD],0);
         }
       }
     }
   }
 
-  // 核心
+  // 放置两个核心（保持原逻辑）
   const valid = (cx,cy)=> cx>=2 && cy>=2 && cx<=W-3 && cy<=H-3;
   let p1=null, p2=null, tries=0;
   while(tries++<500){
@@ -138,10 +138,22 @@ function genMap(room){
   }
   if(!p1){ p1={cx:10,cy:10}; }
   if(!p2){ p2={cx:W-11,cy:H-11}; }
+
+  // 清空核心 3×3 区域并放置核心（保持原逻辑）
   areaClear(room, p1.cx-1, p1.cy-1, 3,3);
   areaClear(room, p2.cx-1, p2.cy-1, 3,3);
   placeCore(room, 1, p1.cx, p1.cy);
   placeCore(room, 2, p2.cx, p2.cy);
+
+  // ★ 新增：将剩余空地全部填成石头（不改已放置的金子与核心）
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const i = y*W + x;
+      if(map[i] === ID_EMPTY){
+        setCell(room, x, y, ID_ROCK, HP[ID_ROCK], 0);
+      }
+    }
+  }
 }
 
 /* -------------------- 建造/拆除 -------------------- */
@@ -239,7 +251,7 @@ function removeTurretAt(room,x,y){
   room.turrets = room.turrets.filter(t=> !(x>=t.x && y>=t.y && x<t.x+t.w && y<t.y+t.h) );
 }
 
-/* -------------------- 射击与子弹 -------------------- */
+/* -------------------- 射击与子弹（包含 DDA 碰撞） -------------------- */
 function withinArc(tx,ty, t){
   const dx = tx - t.cx, dy = ty - t.cy;
   if(dx*dx + dy*dy > t.rangeCells*t.rangeCells) return false;
@@ -255,7 +267,6 @@ function tryShoot(room, t, dt){
   t.cd -= dt;
   if(t.cd>0) return;
 
-  // 目标优先级
   const prio = (id)=> (id===ID_TURRET||id===ID_CIWS||id===ID_SNIPER)?5
                      : (id===ID_CORE_P1||id===ID_CORE_P2)?4
                      : (id===ID_WALL||id===ID_ROAD)?3
@@ -296,7 +307,7 @@ function tryShoot(room, t, dt){
   }
 }
 
-/* === 新增：逐格 DDA 扫描，返回首个可命中的格 === */
+/* === 逐格 DDA 扫描，返回首个可命中的格 === */
 function sweepHitCell(room, x0, y0, x1, y1, team) {
   const W = room.W, H = room.H;
 
@@ -319,7 +330,6 @@ function sweepHitCell(room, x0, y0, x1, y1, team) {
   const tDeltaX = invDx;
   const tDeltaY = invDy;
 
-  // 沿 [0,1] 区间推进
   while (true) {
     if (tMaxX < tMaxY) {
       cx += stepX;
@@ -336,7 +346,6 @@ function sweepHitCell(room, x0, y0, x1, y1, team) {
     const i = cy * W + cx;
     const v = room.map[i];
     if (v !== ID_EMPTY) {
-      // 己方建筑不拦截；中立（石头/金子 owner=0）与敌方可拦截
       if (room.owner[i] !== team) {
         return { cx, cy, i, v };
       }
@@ -344,7 +353,7 @@ function sweepHitCell(room, x0, y0, x1, y1, team) {
   }
 }
 
-/* === 替换：子弹步进，使用 DDA 扫描路径 === */
+/* === 子弹步进，使用 DDA 扫描路径 === */
 function stepBullets(room, dt){
   const { map, hp, owner } = room;
 
@@ -360,7 +369,6 @@ function stepBullets(room, dt){
       const i = hit.i;
       const v = map[i];
 
-      // 对非己方方块结算（石头/金子 owner=0 也会命中）
       const damage = Math.min(9999, hp[i]);
       hp[i] -= damage;
 
@@ -371,15 +379,13 @@ function stepBullets(room, dt){
         if (v === ID_TURRET || v === ID_CIWS || v === ID_SNIPER) {
           removeTurretAt(room, hit.cx, hit.cy);
         }
-        // 清空格
         map[i] = ID_EMPTY; hp[i] = 0; owner[i] = 0;
       }
 
-      b.dead = true;        // 首次命中即销毁
+      b.dead = true;
       continue;
     }
 
-    // 无碰撞则更新位置
     b.x = nx; b.y = ny;
   }
 
@@ -423,14 +429,12 @@ function checkWin(room){
   }
 }
 function broadcast(room, msg){
-  // 两名玩家
   for(const pid of [1,2]){
     const p = room.players[pid];
     if(p && p.ws.readyState===WebSocket.OPEN){
       p.ws.send(JSON.stringify(msg));
     }
   }
-  // 观战者
   for(const ws of room.spectators){
     if(ws.readyState===WebSocket.OPEN){
       ws.send(JSON.stringify(msg));
@@ -508,7 +512,6 @@ function handleRefreshVote(ws, accept){
 
 /* -------------------- 连接与消息 -------------------- */
 wss.on('connection', (ws)=>{
-  // 分配：P1/P2/观战
   if(!room.players[1]){
     room.players[1] = { id:1, name:'P1', ws };
     ws.__role='player'; ws.__pid=1;
@@ -520,7 +523,6 @@ wss.on('connection', (ws)=>{
     ws.__role='spectator'; ws.__pid=0;
   }
 
-  // start
   const startMsg = { type:'start', role: ws.__role, W, H };
   if(ws.__role==='player') startMsg.you = ws.__pid;
   ws.send(JSON.stringify(startMsg));
