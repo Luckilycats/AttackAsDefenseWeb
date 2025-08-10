@@ -1,8 +1,7 @@
-// main.js — 连续建造：本地幽灵 + Supercover + 按帧批量发送 + 去重 + 失败回滚
-// 建筑无外框；石头/金子保留外框；扇形开关；同源 WebSocket
-// 性能优化：Path2D 箭头、子弹数组视图 + 降采样、装饰层自适应跳过、幽灵批量绘制
+// main.js — 单房间自动联机：两名为玩家，其余观战；顶部显示“玩家/观战”人数
+// 性能：Path2D 箭头、子弹数组视图+降采样、装饰层自适应跳过、幽灵批量绘制
+// 说明：颜色与渲染不依赖 S.you；观战模式正确区分 1 队(蓝)/2 队(红)
 
-// —— 画布与 UI —— //
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
@@ -18,42 +17,19 @@ const goldEl     = document.getElementById('gold');
 const toastEl    = document.getElementById('toast');
 const buildButtons = [btnRoad, btnWall, btnTurret, btnCiws, btnSniper];
 
-// —— 同源 WebSocket 基地址（自动匹配 http→ws / https→wss） —— //
 const WS_URL = location.origin.startsWith('https')
   ? location.origin.replace(/^https/, 'wss')
   : location.origin.replace(/^http/,  'ws');
 
-// —— 颜色 —— //
+// 颜色：固定映射——队伍1=蓝，队伍2=红，观战亦同
 const COLOR = {
-  // 己方（蓝系）
-  allyCore:   '#2b7bff',
-  allyRoad:   '#6fa8ff',
-  allyWall:   '#1f5fe0',
-  allyTurret: '#4f91ff',
-  allyCiws:   '#3a7aff',
-  allySniper: '#1a54cc',
-  // 敌方（红系）
-  enemyCore:   '#ff3b3b',
-  enemyRoad:   '#ff7a7a',
-  enemyWall:   '#e02a2a',
-  enemyTurret: '#ff5f5f',
-  enemyCiws:   '#ff4242',
-  enemySniper: '#cc1a1a',
-  // 中立
-  rock:   '#7b7b7b',
-  gold:   '#d8b401',
-  // 网格与描边
-  gridA:  '#2a2a2a',
-  gridB:  '#242424',
-  resStroke: '#1a1a1a',
-  // 阵营通用（预览/扇形/选框）
-  ally:       '#2b7bff',
-  allyLight:  '#75a9ff',
-  enemy:      '#ff3b3b',
-  enemyLight: '#ff8a8a',
+  t1Core:   '#2b7bff', t1Road:'#6fa8ff', t1Wall:'#1f5fe0', t1Turret:'#4f91ff', t1Ciws:'#3a7aff', t1Sniper:'#1a54cc',
+  t2Core:   '#ff3b3b', t2Road:'#ff7a7a', t2Wall:'#e02a2a', t2Turret:'#ff5f5f', t2Ciws:'#ff4242', t2Sniper:'#cc1a1a',
+  rock:'#7b7b7b', gold:'#d8b401',
+  gridA:'#2a2a2a', gridB:'#242424', resStroke:'#1a1a1a',
+  t1:'#2b7bff', t1Light:'#75a9ff', t2:'#ff3b3b', t2Light:'#ff8a8a',
 };
 
-// —— 攻击范围开关按钮 —— //
 const btnToggleArcs = document.createElement('button');
 btnToggleArcs.textContent='显示攻击范围';
 Object.assign(btnToggleArcs.style,{
@@ -63,29 +39,28 @@ Object.assign(btnToggleArcs.style,{
 });
 document.body.appendChild(btnToggleArcs);
 
-// —— 顶部身份标签 —— //
-const youEl = document.createElement('span');
-youEl.id='you-label';
-youEl.style.marginLeft = '12px';
-document.getElementById('topbar')?.appendChild(youEl);
+// 顶部标签：身份 与 人数
+const youEl = document.createElement('span'); youEl.id='you-label'; youEl.style.marginLeft='12px';
+const countsEl = document.createElement('span'); countsEl.id='counts-label'; countsEl.style.marginLeft='12px';
+document.getElementById('topbar')?.append(youEl, countsEl);
 
-// —— 常量 —— //
+// 常量
 const CELL=8;
 const DIR_TO_RAD = [0, Math.PI/2, Math.PI, -Math.PI/2];
-const FADE_T = 0.25;               // 子弹淡出（已不再使用）
-const GHOST_FADE_T = 0.25;         // 幽灵回滚淡出
-const GHOST_TIMEOUT = 1.0;         // 超时未被服务器采纳则回滚
-const MAX_SEND_PER_FRAME = 160;    // 每帧最大发送建造数
-const MAX_PROCESS_PER_FRAME = 400; // 每帧最大插值格数
+const GHOST_FADE_T = 0.25;
+const GHOST_TIMEOUT = 1.0;
+const MAX_SEND_PER_FRAME = 160;
+const MAX_PROCESS_PER_FRAME = 400;
 
 function deg2rad(d){ return d*Math.PI/180; }
 function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
 
-// —— 性能状态 —— //
+// 性能状态
 let _lastFrameCostMs = 0;
-let _skipDecor = false; // 跳过装饰层（箭头、扇形）以稳帧
+let _skipDecor = false;
 
-// —— 状态 —— //
+// 全局状态
+let ROLE = 'spectator'; // 'player' | 'spectator'
 let showArcs=false;
 let mode='browse';
 let selectedType=null;
@@ -95,13 +70,11 @@ let lastConfirmedDir=0;
 let hoverX=-1, hoverY=-1;
 let isMouseDown=false, selecting=false;
 let selectStart=null, selectEnd=null;
-
-// 指针捕获
 let activePointerId=null;
 
-// —— 服务器快照（只读） —— //
+// 服务器快照
 const S = {
-  you: 0,
+  you: 0, // 0=观战
   W: 100, H: 100,
   gold: {1:0,2:0},
   core: { p1:1000, p2:1000 },
@@ -111,29 +84,28 @@ const S = {
   turrets: []
 };
 
-// —— 本地子弹 —— //
-const Local = { bullets: new Map(), arr: [] }; // arr 为数组视图，用于高效绘制
+// 子弹（本地插值 + 数组视图）
+const Local = { bullets: new Map(), arr: [] };
 
-// —— 本地幽灵（未被服务端确认的本地回显） —— //
+// 幽灵（仅玩家使用）
 const Ghost = {
-  // key: `${x},${y},${w}x${h}`
-  items: new Map(), // value: {x,y,w,h,type,dir,team,alpha,t0,status}
-  placedKeySet: new Set(), // 一次拖动内去重
-  queue: [],               // 待发送建造请求 {x,y,type,dir,key}
-  pendingSet: new Set(),   // key 集
-  cellQueue: []            // 插值待处理队列 [{x,y}]
+  items: new Map(),
+  placedKeySet: new Set(),
+  queue: [],
+  pendingSet: new Set(),
+  cellQueue: []
 };
 
-// —— 背景离屏缓存 —— //
+// 背景离屏缓存
 let bgCanvas=null, bgCtx=null, bgDirty=true;
 
-// —— 简易音效 —— //
+// 简易音效
 let AC=null;
 function ac(){ if(!AC){ AC=new (window.AudioContext||window.webkitAudioContext)(); } return AC; }
 function beep(freq=600, dur=0.06, vol=0.08){ try{ const a=ac(); const o=a.createOscillator(); const g=a.createGain(); o.type='square'; o.frequency.value=freq; g.gain.value=vol; o.connect(g); g.connect(a.destination); const t=a.currentTime; o.start(t); o.stop(t+dur);}catch{} }
 function sfx_fire(){ beep(760,0.04,0.06); }
 
-// —— 事件 —— //
+// 交互按钮
 btnToggleArcs.onclick = ()=>{
   showArcs=!showArcs;
   btnToggleArcs.textContent = showArcs?'隐藏攻击范围':'显示攻击范围';
@@ -143,8 +115,12 @@ function labelOf(t){
   return t==='road'?'道路':t==='wall'?'围墙':t==='turret'?'基础炮':t==='ciws'?'近防炮':t==='sniper'?'狙击炮':'';
 }
 function updateHUD(){
-  goldEl.textContent = S.gold[S.you]||0;
-  youEl.textContent = S.you ? `你是：P${S.you}` : '';
+  if(ROLE==='player'){
+    youEl.textContent = S.you ? `你是：P${S.you}` : '你是：P?';
+  }else{
+    youEl.textContent = '观战中';
+  }
+  goldEl.textContent = (S.gold[1]||0) + ' / ' + (S.gold[2]||0); // 双方金量概览
 }
 function toast(msg,ms=1000){
   toastEl.textContent=msg;
@@ -153,8 +129,9 @@ function toast(msg,ms=1000){
   toastEl._t=setTimeout(()=>toastEl.hidden=true,ms);
 }
 
-// —— 模式 —— //
+// 模式
 function enterBuildMode(type){
+  if(ROLE!=='player') return;
   mode='build'; selectedType=type;
   buildButtons.forEach(b=>b.classList.toggle('active', b.dataset.type===type));
   btnDemo.classList.remove('active');
@@ -162,6 +139,7 @@ function enterBuildMode(type){
   modeLabel.textContent = `建造模式：${labelOf(type)}（R旋转，长按连续建造）`;
 }
 function enterDemolishMode(){
+  if(ROLE!=='player') return;
   mode='demolish'; selectedType=null;
   buildButtons.forEach(b=>b.classList.remove('active'));
   btnDemo.classList.add('active');
@@ -171,7 +149,7 @@ function enterBrowseMode(){
   mode='browse'; selectedType=null;
   buildButtons.forEach(b=>b.classList.remove('active'));
   btnDemo.classList.remove('active');
-  modeLabel.textContent='浏览模式（F1 查看帮助）';
+  modeLabel.textContent = (ROLE==='player') ? '浏览模式（F1 查看帮助）' : '观战模式';
   selecting=false; selectStart=null; selectEnd=null;
 }
 
@@ -185,6 +163,7 @@ function initUI(){
   btnCancel.onclick = ()=>enterBrowseMode();
 
   window.addEventListener('keydown',(e)=>{
+    if(ROLE!=='player') return;
     const k=e.key.toLowerCase();
     if(k==='1') enterBuildMode('road');
     else if(k==='2') enterBuildMode('wall');
@@ -197,7 +176,7 @@ function initUI(){
   });
 }
 
-// —— 坐标转换 —— //
+// 坐标
 function pointerToCell(e){
   const r=canvas.getBoundingClientRect();
   const px = e.clientX - r.left;
@@ -207,7 +186,7 @@ function pointerToCell(e){
   return {px,py,mx,my};
 }
 
-// —— footprint & 取色 —— //
+// footprint 与配色（队伍 1=蓝，2=红）
 function getFootprint(type, dir){
   if(type==='turret') return {w:2,h:2};
   if(type==='ciws')   return (dir===0||dir===2)?{w:3,h:2}:{w:2,h:3};
@@ -215,41 +194,34 @@ function getFootprint(type, dir){
   if(type==='road'||type==='wall') return {w:1,h:1};
   return {w:1,h:1};
 }
-function colorForCell(v, owner, you){
-  const ally = (owner===you);
+
+function colorForCellTeam(v, ownerTeam){
+  const t1 = ownerTeam===1, t2 = ownerTeam===2;
   switch(v){
     case 1:  return COLOR.rock;
     case 2:  return COLOR.gold;
-    case 3:
-    case 4:  return ally ? COLOR.allyCore   : COLOR.enemyCore;
-    case 10: return ally ? COLOR.allyRoad   : COLOR.enemyRoad;
-    case 11: return ally ? COLOR.allyWall   : COLOR.enemyWall;
-    case 12: return ally ? COLOR.allyTurret : COLOR.enemyTurret;
-    case 13: return ally ? COLOR.allyCiws   : COLOR.enemyCiws;
-    case 14: return ally ? COLOR.allySniper : COLOR.enemySniper;
+    case 3:  return t1?COLOR.t1Core:COLOR.t2Core;
+    case 4:  return t2?COLOR.t2Core:COLOR.t1Core;
+    case 10: return t1?COLOR.t1Road:COLOR.t2Road;
+    case 11: return t1?COLOR.t1Wall:COLOR.t2Wall;
+    case 12: return t1?COLOR.t1Turret:COLOR.t2Turret;
+    case 13: return t1?COLOR.t1Ciws:COLOR.t2Ciws;
+    case 14: return t1?COLOR.t1Sniper:COLOR.t2Sniper;
     default: return null;
   }
 }
-function colorForType(type, ally){
-  if(ally){
-    if(type==='core')   return COLOR.allyCore;
-    if(type==='road')   return COLOR.allyRoad;
-    if(type==='wall')   return COLOR.allyWall;
-    if(type==='turret') return COLOR.allyTurret;
-    if(type==='ciws')   return COLOR.allyCiws;
-    if(type==='sniper') return COLOR.allySniper;
-  }else{
-    if(type==='core')   return COLOR.enemyCore;
-    if(type==='road')   return COLOR.enemyRoad;
-    if(type==='wall')   return COLOR.enemyWall;
-    if(type==='turret') return COLOR.enemyTurret;
-    if(type==='ciws')   return COLOR.enemyCiws;
-    if(type==='sniper') return COLOR.enemySniper;
-  }
-  return ally ? COLOR.ally : COLOR.enemy;
+function colorForTypeTeam(type, team){
+  const t1 = team===1;
+  if(type==='core')   return t1?COLOR.t1Core:COLOR.t2Core;
+  if(type==='road')   return t1?COLOR.t1Road:COLOR.t2Road;
+  if(type==='wall')   return t1?COLOR.t1Wall:COLOR.t2Wall;
+  if(type==='turret') return t1?COLOR.t1Turret:COLOR.t2Turret;
+  if(type==='ciws')   return t1?COLOR.t1Ciws:COLOR.t2Ciws;
+  if(type==='sniper') return t1?COLOR.t1Sniper:COLOR.t2Sniper;
+  return t1?COLOR.t1:COLOR.t2;
 }
 
-// —— 校验（客户端粗过滤） —— //
+// 校验（客户端粗过滤）
 function inBounds(x,y){ return x>=0&&y>=0&&x<S.W&&y<S.H; }
 function rectInBounds(x,y,w,h){ return x>=0&&y>=0&&(x+w)<=S.W&&(y+h)<=S.H; }
 function areaEmptyClient(x,y,w,h){
@@ -275,10 +247,9 @@ function rectCanBuildHereClient(x,y,w,h){
   return false;
 }
 
-// —— Supercover：覆盖直线经过的所有格 —— //
+// Supercover
 function supercoverLineCells(x0,y0,x1,y1){
-  const cells=[];
-  let dx=x1-x0, dy=y1-y0;
+  const cells=[]; let dx=x1-x0, dy=y1-y0;
   const sx = Math.sign(dx)||1, sy = Math.sign(dy)||1;
   dx=Math.abs(dx); dy=Math.abs(dy);
   let x=x0, y=y0; cells.push({x,y});
@@ -302,20 +273,14 @@ function supercoverLineCells(x0,y0,x1,y1){
   return out;
 }
 
-// —— 预构建箭头 Path2D —— //
+// 预构建箭头 Path2D
 const ARROW_PATHS = (() => {
   const mk = (rot90) => {
     const p = new Path2D();
-    const pts = [
-      {x:+0.5,  y:0.0},
-      {x:-0.5,  y:-0.3},
-      {x:-0.5,  y:+0.3}
-    ];
+    const pts = [{x:+0.5,y:0},{x:-0.5,y:-0.3},{x:-0.5,y:+0.3}];
     const sin = [0,1,0,-1][rot90], cos = [1,0,-1,0][rot90];
     const rx = (x,y)=>({ x: x*cos - y*sin, y: x*sin + y*cos });
-    const a = rx(pts[0].x, pts[0].y);
-    const b = rx(pts[1].x, pts[1].y);
-    const c = rx(pts[2].x, pts[2].y);
+    const a = rx(pts[0].x, pts[0].y), b = rx(pts[1].x, pts[1].y), c = rx(pts[2].x, pts[2].y);
     p.moveTo(a.x, a.y); p.lineTo(b.x, b.y); p.lineTo(c.x, c.y); p.closePath();
     return p;
   };
@@ -340,8 +305,9 @@ function drawArrowFast(cx, cy, facingDir, size, color, alpha=1){
   ctx.restore();
 }
 
-// —— 幽灵 & 发送入队 —— //
+// 幽灵 & 发送（仅玩家）
 function enqueueGhostAndSend(type, x, y, dir){
+  if(ROLE!=='player') return;
   const fp=getFootprint(type, dir);
   const key = `${x},${y},${fp.w}x${fp.h}`;
   if(Ghost.pendingSet.has(key)) return;
@@ -351,34 +317,30 @@ function enqueueGhostAndSend(type, x, y, dir){
 
   Ghost.pendingSet.add(key);
   Ghost.queue.push({x,y,type,dir,key});
-
-  Ghost.items.set(key, {
-    x,y,w:fp.w,h:fp.h,type,dir,team:S.you,alpha:0.9,t0:performance.now(),status:'pending'
-  });
+  Ghost.items.set(key, { x,y,w:fp.w,h:fp.h,type,dir,team:S.you,alpha:0.9,t0:performance.now(),status:'pending' });
 }
 
 // 每帧发送有限数量
 function flushBuildQueue(){
+  if(ROLE!=='player') return;
   let quota = MAX_SEND_PER_FRAME;
   while(quota>0 && Ghost.queue.length){
-    const it = Ghost.queue.shift();
-    quota--;
+    const it = Ghost.queue.shift(); quota--;
     Net.build(it.type, it.x, it.y, it.dir);
     const g = Ghost.items.get(it.key);
     if(g){ g.t0 = performance.now(); g.status='pending'; }
   }
 }
 
-// —— 指针事件：只记录路径点，由 RAF 消费 —— //
+// 指针事件
 let lastDragCell = null;
-
 function initPointer(){
   function handleMoveLike(e){
     const p = pointerToCell(e);
     hoverX=p.mx; hoverY=p.my;
 
     if(isMouseDown && activePointerId===e.pointerId){
-      if(mode==='build' && selectedType){
+      if(mode==='build' && selectedType && ROLE==='player'){
         if(lastDragCell==null){
           lastDragCell={x:p.mx,y:p.my};
           Ghost.cellQueue.push({x:p.mx,y:p.my});
@@ -387,12 +349,11 @@ function initPointer(){
           for(const c of list) Ghost.cellQueue.push(c);
           lastDragCell={x:p.mx,y:p.my};
         }
-      }else if(mode==='demolish' && selecting){
+      }else if(mode==='demolish' && selecting && ROLE==='player'){
         selectEnd={x:p.mx,y:p.my};
       }
     }
   }
-
   canvas.addEventListener('pointerrawupdate', handleMoveLike);
   canvas.addEventListener('pointermove', handleMoveLike);
 
@@ -402,11 +363,11 @@ function initPointer(){
     canvas.setPointerCapture(activePointerId);
     const p = pointerToCell(e);
     isMouseDown=true;
-    if(mode==='build'&&selectedType){
+    if(mode==='build'&&selectedType&&ROLE==='player'){
       Ghost.placedKeySet.clear();
       lastDragCell={x:p.mx,y:p.my};
       Ghost.cellQueue.push({x:p.mx,y:p.my});
-    }else if(mode==='demolish'){
+    }else if(mode==='demolish'&&ROLE==='player'){
       selecting=true; selectStart={x:p.mx,y:p.my}; selectEnd={x:p.mx,y:p.my};
     }
   });
@@ -415,7 +376,7 @@ function initPointer(){
     if(e.pointerId!==activePointerId) return;
     isMouseDown=false; activePointerId=null;
     lastDragCell=null;
-    if(mode==='demolish'&&selecting&&selectStart&&selectEnd){
+    if(mode==='demolish'&&selecting&&selectStart&&selectEnd&&ROLE==='player'){
       Net.demolish(selectStart.x,selectStart.y,selectEnd.x,selectEnd.y);
     }
     selecting=false; selectStart=null; selectEnd=null;
@@ -426,12 +387,12 @@ function initPointer(){
   canvas.addEventListener('contextmenu',(e)=>e.preventDefault());
 }
 
-// —— RAF 消费路径点：逐帧限额补建 + 入队发送 —— //
+// RAF 消费路径点
 function consumeCellQueue(){
+  if(ROLE!=='player') { Ghost.cellQueue.length=0; return; }
   let quota = MAX_PROCESS_PER_FRAME;
   while(quota>0 && Ghost.cellQueue.length){
-    const c = Ghost.cellQueue.shift();
-    quota--;
+    const c = Ghost.cellQueue.shift(); quota--;
     if(!inBounds(c.x,c.y)) continue;
     const fp=getFootprint(selectedType||'road', buildFacingDir);
     const k=`${c.x},${c.y},${fp.w}x${fp.h}`;
@@ -444,26 +405,33 @@ function consumeCellQueue(){
   }
 }
 
-// —— 联机 —— //
-function connectOnline(){
-  const roomId = prompt('输入房间号（6位，例如 A1B2C3）：','A1B2C3') || 'A1B2C3';
-  const name   = prompt('输入昵称：','Relice') || 'Relice';
-  const create = confirm('是否创建该房间？（确定=创建；取消=加入）');
+// 联机：自动进入 GLOBAL，名字来自 ?name= 或随机
+function getQueryName(){
+  const u = new URL(location.href);
+  const nm = u.searchParams.get('name');
+  if(nm) return nm.slice(0,24);
+  return 'Guest-' + Math.random().toString(36).slice(2,6).toUpperCase();
+}
+function connectOnlineAuto(){
+  const name = getQueryName();
 
   Net.onRoom = (m)=>{
-    const allReady = m.players?.every?.(p=>p.ready) ?? true;
-    if(!allReady){
-      if(confirm('进入准备并开始？')){
-        Net.ready(true);
-      }
-    }
+    const pc = m.playerCount ?? 0;
+    const sc = m.spectatorCount ?? 0;
+    countsEl.textContent = `玩家：${pc}/2 | 观战：${sc}`;
   };
   Net.onStart = (m)=>{
-    S.you = m.you; S.W=m.W; S.H=m.H;
+    ROLE = m.role || (m.you? 'player' : 'spectator');
+    S.you = m.you|0; S.W=m.W; S.H=m.H;
     canvas.width  = S.W*CELL;
     canvas.height = S.H*CELL;
     bgDirty = true;
     updateHUD();
+    if(ROLE!=='player'){
+      // 隐藏建造/拆除按钮
+      [...buildButtons, btnDemo, btnCancel].forEach(b=> b?.setAttribute('disabled','disabled'));
+      modeLabel.textContent = '观战模式';
+    }
   };
   Net.onState = (m)=>{
     const hadBullets = Local.bullets.size;
@@ -479,15 +447,16 @@ function connectOnline(){
     if(Local.bullets.size > hadBullets) sfx_fire();
     updateHUD();
 
-    reconcileGhostsWithServer();
+    if(ROLE==='player') reconcileGhostsWithServer();
   };
   Net.onEnded = (m)=>{ toast(m.winner===S.you?'你获胜':'你失败', 3000); };
   Net.onError = (e)=>{ alert('联机错误：'+(e.code||'UNKNOWN')); };
 
-  Net.connect({ roomId, name, create });
-  setTimeout(()=>Net.ready(true), 500);
+  Net.connect({ name }); // 服务端固定 GLOBAL
+  // 无需 ready 流程
 }
 
+// 幽灵与服务器对齐
 function reconcileGhostsWithServer(){
   const now = performance.now();
   for(const [key,g] of Ghost.items){
@@ -518,7 +487,7 @@ function reconcileGhostsWithServer(){
   }
 }
 
-// —— 子弹融合（瞬间消失 + 数组视图） —— //
+// 子弹融合（瞬间消失 + 数组视图）
 function reconcileBulletsFromServer(serverList){
   const seen = new Set();
   for(const sb of serverList){
@@ -535,24 +504,18 @@ function reconcileBulletsFromServer(serverList){
     }
   }
   for(const [id, lb] of Local.bullets){
-    if(!seen.has(id)){
-      Local.bullets.delete(id);
-    }
+    if(!seen.has(id)) Local.bullets.delete(id);
   }
   Local.arr = Array.from(Local.bullets.values());
 }
 
 function updateLocal(dt){
   for(const [id, b] of Local.bullets){
-    if(b.dead){
-      Local.bullets.delete(id);
-      continue;
-    }
+    if(b.dead){ Local.bullets.delete(id); continue; }
     b.x += b.vx * dt;
     b.y += b.vy * dt;
   }
 
-  // 幽灵回滚淡出（避免每帧创建临时数组）
   const _toDel = [];
   for(const [key,g] of Ghost.items){
     if(g.status==='rejected'){
@@ -566,7 +529,7 @@ function updateLocal(dt){
   }
 }
 
-// —— 背景缓存（建筑无外框；资源有外框） —— //
+// 背景缓存
 function ensureBG(){
   if(!bgCanvas || bgCanvas.width!==canvas.width || bgCanvas.height!==canvas.height){
     bgCanvas = document.createElement('canvas');
@@ -578,16 +541,14 @@ function ensureBG(){
   if(!bgDirty) return;
 
   const W=S.W, H=S.H;
-  // 棋盘
   for(let y=0;y<H;y++) for(let x=0;x<W;x++){
     bgCtx.fillStyle=((x+y)&1)?COLOR.gridA:COLOR.gridB;
     bgCtx.fillRect(x*CELL,y*CELL,CELL,CELL);
   }
-  // 地块（静态）
   for(let y=0;y<H;y++) for(let x=0;x<W;x++){
     const idx=y*W+x; const v=S.map[idx]; if(!v) continue;
     const o=S.owner[idx];
-    const fill=colorForCell(v, o, S.you);
+    const fill=colorForCellTeam(v, o);
     if(!fill) continue;
 
     bgCtx.fillStyle = fill;
@@ -602,26 +563,21 @@ function ensureBG(){
   bgDirty = false;
 }
 
-// —— 幽灵绘制（批量填充 + 可选扇形/箭头预览） —— //
+// 幽灵绘制（批量）
 function drawGhosts(){
-  // 1) 批量矩形
-  const groups = new Map(); // key: `${type}-${ally?'a':'e'}` -> {path, color, alphaSum, count}
+  if(ROLE!=='player') return; // 观战不显示本地幽灵
+  const groups = new Map();
   const add = (k, color, x,y,w,h, alpha)=> {
     let g = groups.get(k);
-    if(!g){
-      g = { path: new Path2D(), color, alphaSum:0, count:0 };
-      groups.set(k, g);
-    }
+    if(!g){ g = { path: new Path2D(), color, alphaSum:0, count:0 }; groups.set(k, g); }
     g.path.rect(x*CELL, y*CELL, w*CELL, h*CELL);
     g.alphaSum += alpha; g.count++;
   };
   for(const g of Ghost.items.values()){
-    const ally = (g.team===S.you);
-    const key = g.type + '-' + (ally?'a':'e');
-    const fill = colorForType(g.type, ally);
+    const fill = colorForTypeTeam(g.type, S.you||1);
     const alpha = clamp(g.alpha, 0, 0.9)*0.7;
     if(alpha<=0) continue;
-    add(key, fill, g.x,g.y,g.w,g.h, alpha);
+    add(g.type + '-' + S.you, fill, g.x,g.y,g.w,g.h, alpha);
   }
   for(const {path, color, alphaSum, count} of groups.values()){
     ctx.save();
@@ -631,11 +587,8 @@ function drawGhosts(){
     ctx.restore();
   }
 
-  // 2) 扇形与箭头预览（数量较少；在负载高时可跳过）
   if(_skipDecor) return;
-
   for(const g of Ghost.items.values()){
-    const ally = (g.team===S.you);
     const arc=(g.type==='turret')?90:(g.type==='ciws')?180:(g.type==='sniper')?45:(g.type==='core')?360:0;
     const range=(g.type==='turret')?8:(g.type==='ciws')?3:(g.type==='sniper')?20:(g.type==='core')?16:0;
     if(arc<=0) continue;
@@ -645,7 +598,7 @@ function drawGhosts(){
     const r=range*CELL;
 
     ctx.save(); ctx.globalAlpha=0.16;
-    ctx.fillStyle = ally?COLOR.allyLight:COLOR.enemyLight;
+    ctx.fillStyle = (S.you===1)?COLOR.t1Light:COLOR.t2Light;
     if(arc<360){
       const center=DIR_TO_RAD[cenDir|0];
       ctx.beginPath();
@@ -657,22 +610,22 @@ function drawGhosts(){
     ctx.restore();
 
     if(g.type!=='core'){
-      const color = ally?COLOR.ally:COLOR.enemy;
+      const color = (S.you===1)?COLOR.t1:COLOR.t2;
       drawArrowFast(cx, cy, cenDir, Math.min(g.w,g.h)*CELL*0.9, color, 0.9);
     }
   }
 }
 
-// —— 主绘制 —— //
+// 主绘制
 function draw(){
   ensureBG();
   ctx.drawImage(bgCanvas, 0, 0);
 
-  // 服务端扇形/核心圆（自适应跳过）
+  // 服务端扇形/核心圆
   if(showArcs && !_skipDecor){
     for(const t of S.turrets){
       const r=t.rangeCells*CELL;
-      const colorFill=(t.team===S.you)?COLOR.allyLight:COLOR.enemyLight;
+      const colorFill=(t.team===1)?COLOR.t1Light:COLOR.t2Light;
       if(t.arcDeg<360){
         const center=DIR_TO_RAD[t.facingDir|0];
         ctx.save(); ctx.globalAlpha=0.15; ctx.fillStyle=colorFill;
@@ -688,45 +641,45 @@ function draw(){
     }
   }
 
-  // 炮台方向箭头（核心不画；在高负载时跳过）
+  // 炮台箭头（核心不画）
   if(!_skipDecor){
     for(const t of S.turrets){
       if(t.role==='core') continue;
-      const color = (t.team===S.you)?COLOR.ally:COLOR.enemy;
+      const color = (t.team===1)?COLOR.t1:COLOR.t2;
       drawArrowFast(t.cx*CELL, t.cy*CELL, t.facingDir, Math.min(t.w,t.h)*CELL*0.9, color, 0.95);
     }
   }
 
-  // 幽灵建筑（本地回显层）
+  // 幽灵（仅玩家）
   drawGhosts();
 
-  // 子弹批量绘制（数组视图 + 自适应降采样）
+  // 子弹（按队伍颜色；与 S.you 无关）
   const n = Local.arr.length;
   const step = (n > 1200) ? 3 : (n > 700) ? 2 : 1;
 
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = '#ffffff'; // 队伍1
   ctx.beginPath();
   for (let i=0;i<n;i+=step){
     const b = Local.arr[i];
-    if(b.team===S.you) ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
+    if(b.team===1) ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
   }
   ctx.fill();
 
-  ctx.fillStyle = '#ffd1d1';
+  ctx.fillStyle = '#ffd1d1'; // 队伍2
   ctx.beginPath();
   for (let i=0;i<n;i+=step){
     const b = Local.arr[i];
-    if(b.team!==S.you) ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
+    if(b.team===2) ctx.rect(b.x*CELL-2, b.y*CELL-2, 4, 4);
   }
   ctx.fill();
 
-  // 建造预览框
-  if(mode==='build'&&selectedType&&hoverX>=0&&hoverY>=0){
+  // 建造预览框（仅玩家）
+  if(ROLE==='player' && mode==='build'&&selectedType&&hoverX>=0&&hoverY>=0){
     const fp=getFootprint(selectedType, buildFacingDir);
     const ok=rectInBounds(hoverX,hoverY,fp.w,fp.h)&&areaEmptyClient(hoverX,hoverY,fp.w,fp.h)&&rectCanBuildHereClient(hoverX,hoverY,fp.w,fp.h);
-    ctx.globalAlpha=0.35; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+    ctx.globalAlpha=0.35; ctx.fillStyle= ok ? (S.you===1?COLOR.t1:COLOR.t2) : COLOR.t2;
     ctx.fillRect(hoverX*CELL,hoverY*CELL,fp.w*CELL,fp.h*CELL); ctx.globalAlpha=1;
-    ctx.lineWidth=1; ctx.strokeStyle=ok?COLOR.allyLight:COLOR.enemyLight;
+    ctx.lineWidth=1; ctx.strokeStyle= ok ? (S.you===1?COLOR.t1Light:COLOR.t2Light) : COLOR.t2Light;
     ctx.strokeRect(hoverX*CELL+0.5,hoverY*CELL+0.5,fp.w*CELL-1,fp.h*CELL-1);
 
     if(!_skipDecor){
@@ -738,33 +691,33 @@ function draw(){
         const center=DIR_TO_RAD[cenDir|0]; const r=range*CELL;
 
         if(arc<360){
-          ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+          ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle= ok ? (S.you===1?COLOR.t1:COLOR.t2) : COLOR.t2;
           ctx.beginPath(); const a0=center-deg2rad(arc)/2, a1=center+deg2rad(arc)/2;
           ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,a0,a1); ctx.closePath(); ctx.fill(); ctx.restore();
         }else{
-          ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle=ok?COLOR.ally:COLOR.enemy;
+          ctx.save(); ctx.globalAlpha=0.22; ctx.fillStyle= ok ? (S.you===1?COLOR.t1:COLOR.t2) : COLOR.t2;
           ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.closePath(); ctx.fill(); ctx.restore();
         }
 
         if(selectedType!=='core'){
-          const colorPreview = ok ? COLOR.ally : COLOR.enemy;
+          const colorPreview = S.you===1 ? COLOR.t1 : COLOR.t2;
           drawArrowFast(cx, cy, cenDir, Math.min(fp.w,fp.h)*CELL*0.9, colorPreview, 0.95);
         }
       }
     }
-  }else if(mode==='demolish'&&selecting&&selectStart&&selectEnd){
+  }else if(ROLE==='player' && mode==='demolish'&&selecting&&selectStart&&selectEnd){
     const x0=Math.min(selectStart.x,selectEnd.x)*CELL;
     const x1=(Math.max(selectStart.x,selectEnd.x)+1)*CELL;
     const y0=Math.min(selectStart.y,selectEnd.y)*CELL;
     const y1=(Math.max(selectStart.y,selectEnd.y)+1)*CELL;
     const w=x1-x0, h=y1-y0;
-    ctx.globalAlpha=0.25; ctx.fillStyle=COLOR.enemy; ctx.fillRect(x0,y0,w,h); ctx.globalAlpha=1;
-    ctx.lineWidth=2; ctx.setLineDash([6,4]); ctx.strokeStyle=COLOR.enemyLight;
+    ctx.globalAlpha=0.25; ctx.fillStyle=COLOR.t2; ctx.fillRect(x0,y0,w,h); ctx.globalAlpha=1;
+    ctx.lineWidth=2; ctx.setLineDash([6,4]); ctx.strokeStyle=COLOR.t2Light;
     ctx.strokeRect(x0+1,y0+1,w-2,h-2); ctx.setLineDash([]);
   }
 }
 
-// —— 帧循环 —— //
+// 帧循环
 let _rafLast = performance.now();
 function loop(ts){
   const t0 = performance.now();
@@ -772,7 +725,6 @@ function loop(ts){
   const dt = Math.min(0.05, (ts - _rafLast)/1000);
   _rafLast = ts;
 
-  // 逐帧消化采样格 & 入队发送
   consumeCellQueue();
   flushBuildQueue();
 
@@ -781,22 +733,22 @@ function loop(ts){
 
   const used = performance.now() - t0;
   _lastFrameCostMs = used;
-  _skipDecor = used > 18; // >18ms：下一帧跳过装饰层以稳帧
+  _skipDecor = used > 18;
 
   requestAnimationFrame(loop);
 }
 
-// —— 启动 —— //
+// 启动
 function initAll(){
   initUI();
   initPointer();
   updateHUD();
-  document.getElementById('btn-online')?.addEventListener('click', connectOnline);
+  connectOnlineAuto();              // 打开即联机
   requestAnimationFrame(loop);
 }
 initAll();
 
-// === 固定顶/底栏空间自适配（方式2） ===
+// 固定顶/底栏空间自适配
 (function () {
   function reserveSpaceForFixedBars() {
     const d = document;
@@ -826,7 +778,7 @@ initAll();
   window.__reserveFixedBars = reserveSpaceForFixedBars;
 })();
 
-// —— Net 传输层（若页面中已存在 Net 则不覆盖；使用同源 WS_URL） —— //
+// Net（同源 WS）
 (function(){
   if (window.Net) return;
   const Net = {};
@@ -838,11 +790,9 @@ initAll();
   Net.onEnded= ()=>{};
   Net.onError= (e)=>{ console.error(e); };
 
-  Net.connect = function({roomId='A1B2C3', name='Relice', create=true}={}){
+  Net.connect = function({name='Guest'}={}){
     ws = new WebSocket(WS_URL);
-    ws.onopen = ()=> {
-      ws.send(JSON.stringify({type:'join', roomId, name, create}));
-    };
+    ws.onopen = ()=> { ws.send(JSON.stringify({type:'join', name})); };
     ws.onmessage = (ev)=>{
       let m; try{ m=JSON.parse(ev.data);}catch{ return; }
       switch(m.type){
@@ -857,7 +807,7 @@ initAll();
     ws.onclose = ()=>{};
     Net._ws = ws;
   };
-  Net.ready = function(flag){ ws && ws.send(JSON.stringify({type:'ready', ready: !!flag})); };
+  Net.ready = function(flag){}; // 兼容保留
   Net.build = function(kind,x,y,dir){ ws && ws.send(JSON.stringify({type:'build', kind, x, y, dir})); };
   Net.demolish = function(x0,y0,x1,y1){ ws && ws.send(JSON.stringify({type:'demolish', x0,y0,x1,y1})); };
 
