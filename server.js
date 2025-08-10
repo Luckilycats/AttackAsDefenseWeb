@@ -37,6 +37,47 @@ const DIR = [ {x:1,y:0}, {x:0,y:1}, {x:-1,y:0}, {x:0,y:-1} ]; // 0右1下2左3�
 const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
 const dist2 = (ax,ay,bx,by)=> (ax-bx)*(ax-bx)+(ay-by)*(ay-by);
 
+/* === 阻挡规则与网格工具 === */
+function tileBlocksBullet(id){
+  // 道路(10)不阻挡；其他实体阻挡（含金子）
+  return id===ID_ROCK || id===ID_GOLD || id===ID_CORE_P1 || id===ID_CORE_P2 ||
+         id===ID_WALL || id===ID_TURRET || id===ID_CIWS || id===ID_SNIPER;
+}
+function tileBlocksVision(id){
+  // 视线阻挡规则与子弹一致
+  return tileBlocksBullet(id);
+}
+// Bresenham 整格连线（返回包含起点与终点的格坐标）
+function lineCells(x0,y0,x1,y1){
+  let x = Math.floor(x0), y = Math.floor(y0);
+  const xe = Math.floor(x1), ye = Math.floor(y1);
+  const dx = Math.abs(xe - x), dy = Math.abs(ye - y);
+  const sx = x < xe ? 1 : -1;
+  const sy = y < ye ? 1 : -1;
+  let err = dx - dy;
+  const out = [];
+  while(true){
+    out.push({x,y});
+    if(x===xe && y===ye) break;
+    const e2 = err * 2;
+    if(e2 > -dy){ err -= dy; x += sx; }
+    if(e2 <  dx){ err += dx; y += sy; }
+  }
+  return out;
+}
+// 视线判定：忽略起点与终点之间的所有格，若存在“阻挡且非己方”则不可见
+function hasLineOfSight(room, x0,y0, x1,y1, team){
+  const cells = lineCells(x0,y0,x1,y1);
+  for(let i=1;i<cells.length-1;i++){
+    const {x,y} = cells[i];
+    if(x<0||y<0||x>=W||y>=H) return false;
+    const id = room.map[y*W+x];
+    const own = room.owner[y*W+x] === team;
+    if(!own && tileBlocksVision(id)) return false;
+  }
+  return true;
+}
+
 /* -------------------- 房间结构 -------------------- */
 const rooms = new Map(); // roomId -> room
 
@@ -276,23 +317,21 @@ function tryShoot(room, t, dt){
     for(let x=x0;x<=x1;x++){
       const i=y*W+x, id=room.map[i]; if(id===ID_EMPTY) continue;
       const o=room.owner[i];
-      // 自己子弹无伤害：跳过己方
+      // 己方格跳过
       if(o===t.team && (id===ID_TURRET||id===ID_CIWS||id===ID_SNIPER||id===ID_WALL||id===ID_ROAD||id===ID_CORE_P1||id===ID_CORE_P2)) continue;
-      if(!withinArc(x+0.5,y+0.5,t)) continue;
+      const cx = x+0.5, cy = y+0.5;
+      if(!withinArc(cx,cy,t)) continue;
+      // 视线必须可达（忽略己方阻挡）
+      if(!hasLineOfSight(room, t.cx, t.cy, cx, cy, t.team)) continue;
+
       const s = prio(id); if(s===0) continue;
-      const d2v = dist2(t.cx,t.cy, x+0.5,y+0.5);
+      const d2v = dist2(t.cx,t.cy, cx,cy);
       if(s>bestScore || (s===bestScore && d2v<bestDist)){
-        best = {x:x+0.5, y:y+0.5}; bestScore=s; bestDist=d2v;
+        best = {x:cx, y:cy}; bestScore=s; bestDist=d2v;
       }
     }
   }
 
-  if(best){
-    // 开火
-    const ang = Math.atan2(best.y - t.cx /* typo deliberately? no, fix */, best.x - t.cx);
-  }
-
-  // 正确计算角度
   if(best){
     const ang = Math.atan2(best.y - t.cy, best.x - t.cx);
     const scatter = (t.scatterDeg||0) * (Math.PI/180);
@@ -306,41 +345,51 @@ function tryShoot(room, t, dt){
     t.cd = 1/(t.fireRate||1);
   }
 }
-function stepBullets(room, dt){
-  const {map,hp,owner} = room;
-  for(let b of room.bullets){
-    b.life -= dt;
-    if(b.life<=0){ b.dead=true; continue; }
-    const nx = b.x + b.vx*dt;
-    const ny = b.y + b.vy*dt;
-    // 碰撞检测：以新位置所处格
-    const cx = Math.floor(nx), cy = Math.floor(ny);
-    if(cx>=0 && cy>=0 && cx<W && cy<H){
-      const i = cy*W+cx, v=map[i];
-      if(v!==ID_EMPTY){
-        // 己方子弹无伤害
-        if(owner[i]!==b.team){
-          const damage = Math.min(bulletHPOf(b.team, v, room), hp[i]);
-          hp[i] -= damage;
-          if(hp[i]<=0){
-            // 奖励/移除
-            if(v===ID_GOLD){ room.gold[b.team]+=REWARD_GOLD; }
-            // 若是炮台类，同步删除炮台
-            if(v===ID_TURRET||v===ID_CIWS||v===ID_SNIPER){ removeTurretAt(room,cx,cy); }
-            setCell(room, cx,cy, ID_EMPTY, 0, 0);
-          }
-          b.dead=true; continue;
-        }
-      }
-    }
-    b.x = nx; b.y = ny;
-  }
-  room.bullets = room.bullets.filter(b=>!b.dead);
-}
 function bulletHPOf(team, v, room){
   // 子弹血量直接由发射炮台定义；这里不区分目标，返回一个大值以一次命中即销毁：已在 tryShoot 设置
   // 本函数保留以便后续扩展；暂不使用
   return 9999;
+}
+
+// 子弹推进：沿 b.(x,y)→(nx,ny) 的轨迹逐格检测，避免穿透
+function stepBullets(room, dt){
+  const {map,hp,owner} = room;
+  for(const b of room.bullets){
+    b.life -= dt;
+    if(b.life<=0){ b.dead=true; continue; }
+
+    const nx = b.x + b.vx*dt;
+    const ny = b.y + b.vy*dt;
+
+    // 逐格遍历：从当前格到目标格，跳过起点格
+    const cells = lineCells(b.x, b.y, nx, ny);
+    let hit = false;
+    for(let i=1;i<cells.length;i++){
+      const {x, y} = cells[i];
+      if(x<0||y<0||x>=W||y>=H){ b.dead=true; hit=true; break; } // 出界
+      const idx = y*W+x, v = map[idx];
+      if(v!==ID_EMPTY){
+        const own = owner[idx] === b.team;
+        if(!own && tileBlocksBullet(v)){
+          // 结算伤害：岩石/金子/敌方建筑
+          const dmg = Math.min(bulletHPOf(b.team, v, room), hp[idx]);
+          hp[idx] = Math.max(0, hp[idx] - dmg);
+          if(hp[idx]<=0){
+            if(v===ID_GOLD){ room.gold[b.team]+=REWARD_GOLD; }
+            if(v===ID_TURRET||v===ID_CIWS||v===ID_SNIPER){ removeTurretAt(room,x,y); }
+            setCell(room, x,y, ID_EMPTY, 0, 0);
+          }
+          b.dead = true; hit = true; break;
+        }
+      }
+    }
+    if(!hit){
+      b.x = nx; b.y = ny;
+      // 仍需二次越界保护
+      if(b.x<0||b.y<0||b.x>=W||b.y>=H){ b.dead=true; }
+    }
+  }
+  room.bullets = room.bullets.filter(b=>!b.dead);
 }
 
 function stepTurrets(room, dt){
